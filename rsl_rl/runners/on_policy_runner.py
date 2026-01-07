@@ -97,6 +97,12 @@ class OnPolicyRunner:
         tot_iter = start_iter + num_learning_iterations
         for it in range(start_iter, tot_iter):
             start = time.time()
+            # Rollout-batch *episode* reward stats (per-iteration, episode-based):
+            # We compute these over episodes that TERMINATE during this rollout collection window.
+            # In distributed mode, these are aggregated across ranks to match the full batch.
+            batch_episode_reward_sum = torch.tensor(0.0, dtype=torch.float, device=self.device)
+            batch_episode_count = torch.tensor(0.0, dtype=torch.float, device=self.device)
+            batch_episode_reward_max = torch.tensor(float("-inf"), dtype=torch.float, device=self.device)
             # Rollout
             with torch.inference_mode():
                 for _ in range(self.num_steps_per_env):
@@ -127,6 +133,14 @@ class OnPolicyRunner:
                         cur_episode_length += 1
                         # Clear data for completed episodes
                         new_ids = (dones > 0).nonzero(as_tuple=False)
+                        # Per-episode metrics for this iteration (use full episode return, not truncated-to-window):
+                        # NOTE: cur_reward_sum persists across iterations, so when an episode terminates here,
+                        # cur_reward_sum contains the total reward for that whole episode.
+                        if new_ids.numel() > 0:
+                            ep_returns = cur_reward_sum[new_ids][:, 0]
+                            batch_episode_reward_sum += ep_returns.sum()
+                            batch_episode_count += float(ep_returns.numel())
+                            batch_episode_reward_max = torch.maximum(batch_episode_reward_max, ep_returns.max())
                         rewbuffer.extend(cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
                         lenbuffer.extend(cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
                         cur_reward_sum[new_ids] = 0
@@ -136,6 +150,25 @@ class OnPolicyRunner:
                             irewbuffer.extend(cur_ireward_sum[new_ids][:, 0].cpu().numpy().tolist())
                             cur_ereward_sum[new_ids] = 0
                             cur_ireward_sum[new_ids] = 0
+
+                # Compute rollout-batch EPISODE regret metrics for this iteration.
+                # Note: In distributed mode, we aggregate across ranks.
+                if self.is_distributed:
+                    torch.distributed.all_reduce(batch_episode_reward_sum, op=torch.distributed.ReduceOp.SUM)
+                    torch.distributed.all_reduce(batch_episode_count, op=torch.distributed.ReduceOp.SUM)
+                    torch.distributed.all_reduce(batch_episode_reward_max, op=torch.distributed.ReduceOp.MAX)
+
+                # Convert to Python floats for logging
+                batch_episode_count = float(batch_episode_count.item())
+                if batch_episode_count > 0:
+                    max_batch_total_reward = float(batch_episode_reward_max.item())
+                    mean_batch_total_reward = float((batch_episode_reward_sum / batch_episode_count).item())
+                    regret = float(max_batch_total_reward - mean_batch_total_reward)
+                else:
+                    # No episode ended during this rollout window.
+                    max_batch_total_reward = 0.0
+                    mean_batch_total_reward = 0.0
+                    regret = 0.0
 
                 stop = time.time()
                 collection_time = stop - start
@@ -220,6 +253,18 @@ class OnPolicyRunner:
         self.writer.add_scalar("Perf/collection time", locs["collection_time"], locs["it"])
         self.writer.add_scalar("Perf/learning_time", locs["learn_time"], locs["it"])
 
+        # Log rollout-batch metrics (independent of completed episodes)
+        if (
+            "batch_episode_count" in locs
+            and "max_batch_total_reward" in locs
+            and "mean_batch_total_reward" in locs
+            and "regret" in locs
+            and locs["batch_episode_count"] > 0
+        ):
+            self.writer.add_scalar("Metrics/max_batch_total_reward", locs["max_batch_total_reward"], locs["it"])
+            self.writer.add_scalar("Metrics/mean_batch_total_reward", locs["mean_batch_total_reward"], locs["it"])
+            self.writer.add_scalar("Metrics/regret", locs["regret"], locs["it"])
+
         # Log training
         if len(locs["rewbuffer"]) > 0:
             # Separate logging for intrinsic and extrinsic rewards
@@ -256,6 +301,9 @@ class OnPolicyRunner:
                     f"""{"Mean intrinsic reward:":>{pad}} {statistics.mean(locs["irewbuffer"]):.2f}\n"""
                 )
             log_string += f"""{"Mean reward:":>{pad}} {statistics.mean(locs["rewbuffer"]):.2f}\n"""
+            # Print regret metrics
+            log_string += f"""{"Max batch reward:":>{pad}} {locs["max_batch_total_reward"]:.2f}\n"""
+            log_string += f"""{"Regret:":>{pad}} {locs["regret"]:.2f}\n"""
             # Print episode information
             log_string += f"""{"Mean episode length:":>{pad}} {statistics.mean(locs["lenbuffer"]):.2f}\n"""
         else:
@@ -268,6 +316,9 @@ class OnPolicyRunner:
             )
             for key, value in locs["loss_dict"].items():
                 log_string += f"""{f"{key}:":>{pad}} {value:.4f}\n"""
+            if "max_batch_total_reward" in locs and "regret" in locs:
+                log_string += f"""{"Max batch reward:":>{pad}} {locs["max_batch_total_reward"]:.2f}\n"""
+                log_string += f"""{"Regret:":>{pad}} {locs["regret"]:.2f}\n"""
 
         log_string += ep_string
         log_string += (
