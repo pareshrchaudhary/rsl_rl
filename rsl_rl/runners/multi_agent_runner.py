@@ -15,6 +15,7 @@ from tensordict import TensorDict
 
 import rsl_rl
 from rsl_rl.algorithms import PPO
+from rsl_rl.algorithms.simple_ppo import SimplePPO
 from rsl_rl.env import VecEnv
 from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, resolve_symmetry_config
 from rsl_rl.utils import resolve_obs_groups, store_code_state
@@ -59,7 +60,11 @@ class MultiAgentRunner:
 
         # Resolve observation group mappings per agent.
         self.protagonist_obs_groups = resolve_obs_groups(obs, dict(self.protagonist_obs_groups_raw), ["critic"])
-        self.adversary_obs_groups = resolve_obs_groups(obs, dict(self.adversary_obs_groups_raw), ["critic"])
+
+        adversary_obs_groups_raw = dict(self.adversary_obs_groups_raw)
+        if "critic" not in adversary_obs_groups_raw:
+            adversary_obs_groups_raw["critic"] = list(adversary_obs_groups_raw.get("policy", []))
+        self.adversary_obs_groups = resolve_obs_groups(obs, adversary_obs_groups_raw, ["critic"])
 
         # Create the algorithms (IPPO).
         self.alg_protagonist = self._construct_agent_algorithm(
@@ -76,7 +81,7 @@ class MultiAgentRunner:
             policy_cfg=self.policy_adversary_cfg_raw,
             alg_cfg=self.alg_adversary_cfg_raw,
             action_dim=self.adversary_action_dim,
-            storage_horizon=self.adversary_update_every_k_steps,
+            storage_horizon=1,
         )
         # Compatibility with OnPolicyRunner-style downstream code.
         # The protagonist is the "main" policy (used for inference/export/etc.).
@@ -163,12 +168,11 @@ class MultiAgentRunner:
         # Start training
         start_iter = self.current_learning_iteration
         tot_iter = start_iter + num_learning_iterations
-        # Persist adversary update window across learning iterations so we never leave the
-        # adversary storage partially filled (which can overflow on the next iteration).
-        adv_step = 0
-        adv_reward_window: list[float] = []
         for it in range(start_iter, tot_iter):
             start = time.time()
+            # Reset adversary update window per rollout so we update exactly every k steps within num_steps_per_env.
+            adv_step = 0
+            adv_reward_window: list[float] = []
             # Rollout-batch *episode* reward stats (per-iteration, episode-based):
             # We compute these over episodes that TERMINATE during this rollout collection window.
             # In distributed mode, these are aggregated across ranks to match the full batch.
@@ -219,7 +223,9 @@ class MultiAgentRunner:
 
                     # Process env step for both agents.
                     self.alg_protagonist.process_env_step(obs, rewards, dones, extras)
-                    self.alg_adversary.process_env_step(obs, adv_rewards, dones, extras)
+                    # Bandit-style adversary: only store the transition on the update step.
+                    if do_adv_update:
+                        self.alg_adversary.process_env_step(obs, adv_rewards, dones, extras)
 
                     # Book keeping (protagonist-centric, like OnPolicyRunner)
                     if self.log_dir is not None:
@@ -381,7 +387,7 @@ class MultiAgentRunner:
         adv_step: int,
         adv_reward_window: list[float],
     ) -> tuple[torch.Tensor, int, list[float], bool, float]:
-        """Adversary reward = regret from batch max - current batch mean.
+        """Adversary reward (bandit) emitted every k steps.
 
         For each env.step(), we compute:
             batch_max_t  = max(rewards over envs)
@@ -390,7 +396,8 @@ class MultiAgentRunner:
         When the window length reaches k (= adversary_update_every_k_steps), we compute:
             regret = max(batch_max_{t-k+1:t}) - batch_mean_t
 
-        The adversary receives this regret as a dense per-env reward on that step only.
+        On the update step, we provide the logged scalar regret as a dense per-env bandit return:
+            R_i = regret = window_max - mean(rewards)
         """
         batch_max = float(rewards.max().item())
         batch_mean = float(rewards.mean().item())

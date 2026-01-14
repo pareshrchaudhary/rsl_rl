@@ -216,6 +216,43 @@ class RolloutStorage:
                     masks_batch,
                 )
 
+    def bandit_mini_batch_generator(self, num_mini_batches: int, num_epochs: int = 1) -> Generator:
+        """Mini-batch generator for bandit-style actor-only updates.
+
+        Yields rewards (treated as returns) instead of values/returns/advantages.
+        """
+        if self.training_type != "rl":
+            raise ValueError("This function is only available for reinforcement learning training.")
+        batch_size = self.num_envs * self.num_transitions_per_env
+        mini_batch_size = batch_size // num_mini_batches
+        indices = torch.randperm(num_mini_batches * mini_batch_size, requires_grad=False, device=self.device)
+
+        observations = self.observations.flatten(0, 1)
+        actions = self.actions.flatten(0, 1)
+        rewards = self.rewards.flatten(0, 1)
+        dones = self.dones.flatten(0, 1)
+
+        old_actions_log_prob = self.actions_log_prob.flatten(0, 1)
+        old_mu = self.mu.flatten(0, 1)
+        old_sigma = self.sigma.flatten(0, 1)
+
+        for _ in range(num_epochs):
+            for i in range(num_mini_batches):
+                start = i * mini_batch_size
+                stop = (i + 1) * mini_batch_size
+                batch_idx = indices[start:stop]
+                yield (
+                    observations[batch_idx],
+                    actions[batch_idx],
+                    rewards[batch_idx],
+                    dones[batch_idx],
+                    old_actions_log_prob[batch_idx],
+                    old_mu[batch_idx],
+                    old_sigma[batch_idx],
+                    (None, None),
+                    None,
+                )
+
     # For reinforcement learning with recurrent networks
     def recurrent_mini_batch_generator(self, num_mini_batches: int, num_epochs: int = 8) -> Generator:
         if self.training_type != "rl":
