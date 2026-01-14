@@ -163,12 +163,12 @@ class MultiAgentRunner:
         # Start training
         start_iter = self.current_learning_iteration
         tot_iter = start_iter + num_learning_iterations
+        # Persist adversary update window across learning iterations so we never leave the
+        # adversary storage partially filled (which can overflow on the next iteration).
+        adv_step = 0
+        adv_reward_window: list[float] = []
         for it in range(start_iter, tot_iter):
             start = time.time()
-            # Reset adversary update window per rollout so we update every k steps within num_steps_per_env.
-            adv_step = 0
-            # Track protagonist step batch-max rewards within the adversary update window.
-            adv_reward_window: list[float] = []
             # Rollout-batch *episode* reward stats (per-iteration, episode-based):
             # We compute these over episodes that TERMINATE during this rollout collection window.
             # In distributed mode, these are aggregated across ranks to match the full batch.
