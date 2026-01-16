@@ -10,6 +10,7 @@ import statistics
 import time
 import torch
 import warnings
+import h5py
 from collections import deque
 from tensordict import TensorDict
 
@@ -59,6 +60,9 @@ class OnPolicyRunner:
         self.current_learning_iteration = 0
         self.git_status_repos = [rsl_rl.__file__]
 
+        # Resolve parameter names for logging
+        self.randomized_param_names = self._resolve_randomized_param_names()
+
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False) -> None:
         # Initialize writer
         self._prepare_logging_writer()
@@ -95,14 +99,24 @@ class OnPolicyRunner:
         # Start training
         start_iter = self.current_learning_iteration
         tot_iter = start_iter + num_learning_iterations
+        param_h5_path = None
+        if self.log_dir is not None:
+            param_h5_path = os.path.join(self.log_dir, "raw_params.h5")
+            # Initialize HDF5 file with metadata if it doesn't exist (only from rank 0)
+            if not self.disable_logs and not os.path.exists(param_h5_path):
+                with h5py.File(param_h5_path, "w") as f:
+                    f.attrs["param_names"] = [n.encode("utf-8") for n in self.randomized_param_names]
+        
         for it in range(start_iter, tot_iter):
             start = time.time()
-            # Rollout-batch *episode* reward stats (per-iteration, episode-based):
-            # We compute these over episodes that TERMINATE during this rollout collection window.
-            # In distributed mode, these are aggregated across ranks to match the full batch.
-            batch_episode_reward_sum = torch.tensor(0.0, dtype=torch.float, device=self.device)
-            batch_episode_count = torch.tensor(0.0, dtype=torch.float, device=self.device)
-            batch_episode_reward_max = torch.tensor(float("-inf"), dtype=torch.float, device=self.device)
+            # Track randomized parameters over this rollout window (for logging)
+            param_sum = torch.zeros(16, dtype=torch.float, device=self.device)
+            param_sumsq = torch.zeros(16, dtype=torch.float, device=self.device)
+            param_min = torch.full((16,), float("inf"), dtype=torch.float, device=self.device)
+            param_max = torch.full((16,), float("-inf"), dtype=torch.float, device=self.device)
+            param_count = 0
+            raw_params_list = []  # Store raw parameters before aggregation
+
             # Rollout
             with torch.inference_mode():
                 for _ in range(self.num_steps_per_env):
@@ -116,6 +130,18 @@ class OnPolicyRunner:
                     self.alg.process_env_step(obs, rewards, dones, extras)
                     # Extract intrinsic rewards (only for logging)
                     intrinsic_rewards = self.alg.intrinsic_rewards if self.alg.rnd else None
+
+                    # Extract and track randomized parameters
+                    randomized_params = self._extract_randomized_params()
+                    p = randomized_params.reshape(-1, randomized_params.shape[-1])
+                    # Store raw parameters before aggregation (keep on GPU for distributed gather)
+                    raw_params_list.append(randomized_params.detach())
+                    param_sum = param_sum + p.sum(dim=0)
+                    param_sumsq = param_sumsq + (p * p).sum(dim=0)
+                    param_min = torch.minimum(param_min, p.min(dim=0).values)
+                    param_max = torch.maximum(param_max, p.max(dim=0).values)
+                    param_count += int(p.shape[0])
+
                     # Book keeping
                     if self.log_dir is not None:
                         if "episode" in extras:
@@ -133,14 +159,6 @@ class OnPolicyRunner:
                         cur_episode_length += 1
                         # Clear data for completed episodes
                         new_ids = (dones > 0).nonzero(as_tuple=False)
-                        # Per-episode metrics for this iteration (use full episode return, not truncated-to-window):
-                        # NOTE: cur_reward_sum persists across iterations, so when an episode terminates here,
-                        # cur_reward_sum contains the total reward for that whole episode.
-                        if new_ids.numel() > 0:
-                            ep_returns = cur_reward_sum[new_ids][:, 0]
-                            batch_episode_reward_sum += ep_returns.sum()
-                            batch_episode_count += float(ep_returns.numel())
-                            batch_episode_reward_max = torch.maximum(batch_episode_reward_max, ep_returns.max())
                         rewbuffer.extend(cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
                         lenbuffer.extend(cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
                         cur_reward_sum[new_ids] = 0
@@ -151,28 +169,31 @@ class OnPolicyRunner:
                             cur_ereward_sum[new_ids] = 0
                             cur_ireward_sum[new_ids] = 0
 
-                # Compute rollout-batch EPISODE regret metrics for this iteration.
-                # Note: In distributed mode, we aggregate across ranks.
                 if self.is_distributed:
-                    torch.distributed.all_reduce(batch_episode_reward_sum, op=torch.distributed.ReduceOp.SUM)
-                    torch.distributed.all_reduce(batch_episode_count, op=torch.distributed.ReduceOp.SUM)
-                    torch.distributed.all_reduce(batch_episode_reward_max, op=torch.distributed.ReduceOp.MAX)
+                    # Aggregate randomized parameter stats across ranks
+                    torch.distributed.all_reduce(param_sum, op=torch.distributed.ReduceOp.SUM)
+                    torch.distributed.all_reduce(param_sumsq, op=torch.distributed.ReduceOp.SUM)
+                    torch.distributed.all_reduce(param_min, op=torch.distributed.ReduceOp.MIN)
+                    torch.distributed.all_reduce(param_max, op=torch.distributed.ReduceOp.MAX)
+                    param_count_t = torch.tensor(float(param_count), dtype=torch.float, device=self.device)
+                    torch.distributed.all_reduce(param_count_t, op=torch.distributed.ReduceOp.SUM)
+                    param_count = int(param_count_t.item())
 
-                # Convert to Python floats for logging
-                batch_episode_count = float(batch_episode_count.item())
-                if batch_episode_count > 0:
-                    max_batch_total_reward = float(batch_episode_reward_max.item())
-                    mean_batch_total_reward = float((batch_episode_reward_sum / batch_episode_count).item())
-                    regret = float(max_batch_total_reward - mean_batch_total_reward)
-                else:
-                    # No episode ended during this rollout window.
-                    max_batch_total_reward = 0.0
-                    mean_batch_total_reward = 0.0
-                    regret = 0.0
 
                 stop = time.time()
                 collection_time = stop - start
                 start = stop
+
+                # Finalize randomized parameter stats for logging
+                if param_count > 0:
+                    param_mean = (param_sum / float(param_count)).detach().cpu().tolist()
+                    var_t = (param_sumsq / float(param_count)) - (param_sum / float(param_count)) * (param_sum / float(param_count))
+                    param_std = torch.sqrt(torch.clamp(var_t, min=0.0)).detach().cpu().tolist()
+                    param_min_v = param_min.detach().cpu().tolist()
+                    param_max_v = param_max.detach().cpu().tolist()
+                else:
+                    zeros = [0.0] * 16
+                    param_mean = param_std = param_min_v = param_max_v = zeros
 
                 # Compute returns
                 self.alg.compute_returns(obs)
@@ -184,12 +205,36 @@ class OnPolicyRunner:
             learn_time = stop - start
             self.current_learning_iteration = it
 
-            if self.log_dir is not None and not self.disable_logs:
-                # Log information
-                self.log(locals())
-                # Save model
-                if it % self.save_interval == 0:
-                    self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
+            if self.log_dir is not None:
+                # Log information (only from rank 0)
+                if not self.disable_logs:
+                    self.log(locals())
+                    # Save model
+                    if it % self.save_interval == 0:
+                        self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
+                # Gather and concatenate raw parameters from all ranks, then save
+                if raw_params_list:
+                    raw_params_tensor = torch.cat(raw_params_list, dim=0)  # (local_samples, 16) on GPU
+                    raw_params_list.clear()  # Clear after concatenation
+                    
+                    if self.is_distributed:
+                        # Gather from all ranks
+                        gathered = [torch.zeros_like(raw_params_tensor) for _ in range(self.gpu_world_size)]
+                        torch.distributed.all_gather(gathered, raw_params_tensor)
+                        
+                        # Concatenate all ranks' data on rank 0
+                        all_params = None
+                        if self.gpu_global_rank == 0:
+                            all_params = torch.cat(gathered, dim=0).cpu()
+                    else:
+                        all_params = raw_params_tensor.cpu()
+                    
+                    # Save from rank 0 only (or non-distributed)
+                    if param_h5_path and (not self.is_distributed or self.gpu_global_rank == 0):
+                        with h5py.File(param_h5_path, "a") as f:
+                            group = f.create_group(f"iteration_{it}")
+                            group.create_dataset("raw_params", data=all_params.numpy())
+                            group.attrs["num_samples"] = all_params.shape[0]
 
             # Clear episode infos
             ep_infos.clear()
@@ -205,6 +250,29 @@ class OnPolicyRunner:
         # Save the final model after training
         if self.log_dir is not None and not self.disable_logs:
             self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"))
+        
+        # Gather and save any remaining raw parameters (all ranks participate in gather)
+        if raw_params_list and param_h5_path:
+            raw_params_tensor = torch.cat(raw_params_list, dim=0)  # On GPU
+            raw_params_list.clear()
+            
+            if self.is_distributed:
+                # Gather from all ranks
+                gathered = [torch.zeros_like(raw_params_tensor) for _ in range(self.gpu_world_size)]
+                torch.distributed.all_gather(gathered, raw_params_tensor)
+                
+                # Concatenate all ranks' data on rank 0
+                all_params = None
+                if self.gpu_global_rank == 0:
+                    all_params = torch.cat(gathered, dim=0).cpu()
+            else:
+                all_params = raw_params_tensor.cpu()
+            
+            if param_h5_path and (not self.is_distributed or self.gpu_global_rank == 0):
+                with h5py.File(param_h5_path, "a") as f:
+                    group = f.create_group(f"iteration_{self.current_learning_iteration}")
+                    group.create_dataset("raw_params", data=all_params.numpy())
+                    group.attrs["num_samples"] = all_params.shape[0]
 
     def log(self, locs: dict, width: int = 80, pad: int = 35) -> None:
         # Compute the collection size
@@ -253,17 +321,23 @@ class OnPolicyRunner:
         self.writer.add_scalar("Perf/collection time", locs["collection_time"], locs["it"])
         self.writer.add_scalar("Perf/learning_time", locs["learn_time"], locs["it"])
 
-        # Log rollout-batch metrics (independent of completed episodes)
+        # Log randomized parameters (aggregated over rollout window)
         if (
-            "batch_episode_count" in locs
-            and "max_batch_total_reward" in locs
-            and "mean_batch_total_reward" in locs
-            and "regret" in locs
-            and locs["batch_episode_count"] > 0
+            "param_mean" in locs
+            and "param_std" in locs
+            and "param_min_v" in locs
+            and "param_max_v" in locs
         ):
-            self.writer.add_scalar("Metrics/max_batch_total_reward", locs["max_batch_total_reward"], locs["it"])
-            self.writer.add_scalar("Metrics/mean_batch_total_reward", locs["mean_batch_total_reward"], locs["it"])
-            self.writer.add_scalar("Metrics/regret", locs["regret"], locs["it"])
+            for i, (m, s, mn, mx) in enumerate(
+                zip(locs["param_mean"], locs["param_std"], locs["param_min_v"], locs["param_max_v"])
+            ):
+                name = self.randomized_param_names[i] if i < len(self.randomized_param_names) else f"dim_{i}"
+                sanitized = "".join(c if (c.isalnum() or c in ("_", "-")) else "_" for c in name)
+                tag = f"action_{i:02d}_{sanitized}"
+                self.writer.add_scalar(f"adversary_actions/{tag}/mean", float(m), locs["it"])
+                self.writer.add_scalar(f"adversary_actions/{tag}/std", float(s), locs["it"])
+                self.writer.add_scalar(f"adversary_actions/{tag}/min", float(mn), locs["it"])
+                self.writer.add_scalar(f"adversary_actions/{tag}/max", float(mx), locs["it"])
 
         # Log training
         if len(locs["rewbuffer"]) > 0:
@@ -301,9 +375,6 @@ class OnPolicyRunner:
                     f"""{"Mean intrinsic reward:":>{pad}} {statistics.mean(locs["irewbuffer"]):.2f}\n"""
                 )
             log_string += f"""{"Mean reward:":>{pad}} {statistics.mean(locs["rewbuffer"]):.2f}\n"""
-            # Print regret metrics
-            log_string += f"""{"Max batch reward:":>{pad}} {locs["max_batch_total_reward"]:.2f}\n"""
-            log_string += f"""{"Regret:":>{pad}} {locs["regret"]:.2f}\n"""
             # Print episode information
             log_string += f"""{"Mean episode length:":>{pad}} {statistics.mean(locs["lenbuffer"]):.2f}\n"""
         else:
@@ -508,3 +579,83 @@ class OnPolicyRunner:
                 self.writer = SummaryWriter(log_dir=self.log_dir, flush_secs=10)
             else:
                 raise ValueError("Logger type not found. Please choose 'neptune', 'wandb' or 'tensorboard'.")
+
+    def _resolve_randomized_param_names(self) -> list[str]:
+        cfg_names = self.cfg.get("randomized_param_names", None)
+        if isinstance(cfg_names, (list, tuple)) and len(cfg_names) == 16:
+            return [str(x) for x in cfg_names]
+        return [
+            "robot_static_friction", "robot_dynamic_friction",
+            "insertive_object_static_friction", "insertive_object_dynamic_friction",
+            "receptive_object_static_friction", "receptive_object_dynamic_friction",
+            "table_static_friction", "table_dynamic_friction",
+            "robot_mass_scale", "insertive_object_mass_scale",
+            "receptive_object_mass_scale", "table_mass_scale",
+            "robot_joint_friction_scale", "robot_joint_armature_scale",
+            "gripper_stiffness_scale", "gripper_damping_scale",
+        ]
+
+    def _extract_randomized_params(self) -> torch.Tensor:
+        # In distributed training, each rank should only extract from its assigned environments
+        # If env.num_envs returns total, we need to determine per-rank subset
+        total_envs = self.env.num_envs
+        if self.is_distributed:
+            # Calculate which environments belong to this rank
+            # Typically: rank R handles environments [R * (N/W) : (R+1) * (N/W)]
+            envs_per_rank = total_envs // self.gpu_world_size
+            start_env = self.gpu_global_rank * envs_per_rank
+            end_env = start_env + envs_per_rank if self.gpu_global_rank < self.gpu_world_size - 1 else total_envs
+            num_envs = end_env - start_env
+            env_indices = slice(start_env, end_env)
+        else:
+            num_envs = total_envs
+            env_indices = slice(None)
+        
+        params = torch.zeros((num_envs, 16), dtype=torch.float, device=self.device)
+        scene = self.env.unwrapped.scene
+
+        robot = scene["robot"]
+        materials = robot.root_physx_view.get_material_properties()[env_indices]
+        params[:, 0] = materials[:, :, 0].to(self.device).mean(dim=1)
+        params[:, 1] = materials[:, :, 1].to(self.device).mean(dim=1)
+        current_masses = robot.root_physx_view.get_masses()[env_indices].to(self.device)
+        default_masses = robot.data.default_mass.to(self.device)
+        params[:, 8] = (current_masses / (default_masses + 1e-8)).mean(dim=1)
+        current_friction = robot.data.joint_friction_coeff[env_indices].to(self.device)
+        default_friction = robot.data.default_joint_friction_coeff.to(self.device)
+        params[:, 12] = (current_friction / (default_friction + 1e-8)).mean(dim=1)
+        current_armature = robot.data.joint_armature[env_indices].to(self.device)
+        default_armature = robot.data.default_joint_armature.to(self.device)
+        params[:, 13] = (current_armature / (default_armature + 1e-8)).mean(dim=1)
+        current_stiffness = robot.data.joint_stiffness[env_indices].to(self.device)
+        default_stiffness = robot.data.default_joint_stiffness.to(self.device)
+        params[:, 14] = (current_stiffness / (default_stiffness + 1e-8)).mean(dim=1)
+        current_damping = robot.data.joint_damping[env_indices].to(self.device)
+        default_damping = robot.data.default_joint_damping.to(self.device)
+        params[:, 15] = (current_damping / (default_damping + 1e-8)).mean(dim=1)
+
+        insertive_obj = scene["insertive_object"]
+        materials = insertive_obj.root_physx_view.get_material_properties()[env_indices]
+        params[:, 2] = materials[:, :, 0].to(self.device).mean(dim=1)
+        params[:, 3] = materials[:, :, 1].to(self.device).mean(dim=1)
+        current_masses = insertive_obj.root_physx_view.get_masses()[env_indices].to(self.device)
+        default_masses = insertive_obj.data.default_mass.to(self.device)
+        params[:, 9] = (current_masses / (default_masses + 1e-8)).mean(dim=1)
+
+        receptive_obj = scene["receptive_object"]
+        materials = receptive_obj.root_physx_view.get_material_properties()[env_indices]
+        params[:, 4] = materials[:, :, 0].to(self.device).mean(dim=1)
+        params[:, 5] = materials[:, :, 1].to(self.device).mean(dim=1)
+        current_masses = receptive_obj.root_physx_view.get_masses()[env_indices].to(self.device)
+        default_masses = receptive_obj.data.default_mass.to(self.device)
+        params[:, 10] = (current_masses / (default_masses + 1e-8)).mean(dim=1)
+
+        table = scene["table"]
+        materials = table.root_physx_view.get_material_properties()[env_indices]
+        params[:, 6] = materials[:, :, 0].to(self.device).mean(dim=1)
+        params[:, 7] = materials[:, :, 1].to(self.device).mean(dim=1)
+        current_masses = table.root_physx_view.get_masses()[env_indices].to(self.device)
+        default_masses = table.data.default_mass.to(self.device)
+        params[:, 11] = (current_masses / (default_masses + 1e-8)).mean(dim=1)
+
+        return params

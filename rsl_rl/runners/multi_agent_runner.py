@@ -10,6 +10,7 @@ import statistics
 import time
 import torch
 import warnings
+import h5py
 from collections import deque
 from tensordict import TensorDict
 
@@ -168,6 +169,15 @@ class MultiAgentRunner:
         # Start training
         start_iter = self.current_learning_iteration
         tot_iter = start_iter + num_learning_iterations
+        adv_action_h5_path = None
+        if self.log_dir is not None:
+            adv_action_h5_path = os.path.join(self.log_dir, "adversary_actions.h5")
+            # Initialize HDF5 file with metadata if it doesn't exist (only from rank 0)
+            if not self.disable_logs and not os.path.exists(adv_action_h5_path):
+                with h5py.File(adv_action_h5_path, "w") as f:
+                    f.attrs["action_names"] = [n.encode("utf-8") for n in self.adversary_action_names]
+        
+        raw_adv_actions_list = []  # Store raw adversary actions (for final save if needed)
         for it in range(start_iter, tot_iter):
             start = time.time()
             # Reset adversary update window per rollout so we update exactly every k steps within num_steps_per_env.
@@ -193,6 +203,7 @@ class MultiAgentRunner:
             )
             # Number of samples per action dim (envs * steps, summed across the rollout window).
             adv_action_count = 0
+            raw_adv_actions_list.clear()  # Clear for this iteration
 
             # Rollout
             for _ in range(self.num_steps_per_env):
@@ -200,6 +211,15 @@ class MultiAgentRunner:
                 with torch.inference_mode():
                     # Sample actions from both agents (each uses its own obs_groups mapping).
                     _, adversary_actions, actions = self._act_both(obs)
+                    # In distributed training, slice to only include this rank's environments
+                    if self.is_distributed:
+                        total_envs = self.env.num_envs
+                        envs_per_rank = total_envs // self.gpu_world_size
+                        start_env = self.gpu_global_rank * envs_per_rank
+                        end_env = start_env + envs_per_rank if self.gpu_global_rank < self.gpu_world_size - 1 else total_envs
+                        adversary_actions = adversary_actions[start_env:end_env]
+                    # Store raw adversary actions before aggregation (keep on GPU for distributed gather)
+                    raw_adv_actions_list.append(adversary_actions.detach())
                     adv_action_sum, adv_action_sumsq, adv_action_min, adv_action_max, adv_action_count = (
                         self._update_adv_action_stats(
                             adv_action_sum,
@@ -309,12 +329,37 @@ class MultiAgentRunner:
             learn_time = stop - start
             self.current_learning_iteration = it
 
-            if self.log_dir is not None and not self.disable_logs:
-                # Log information
-                self.log(locals())
-                # Save model
-                if it % self.save_interval == 0:
-                    self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
+            if self.log_dir is not None:
+                # Log information (only from rank 0)
+                if not self.disable_logs:
+                    self.log(locals())
+                    # Save model
+                    if it % self.save_interval == 0:
+                        self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
+                
+                # Gather and concatenate raw adversary actions from all ranks, then save
+                if raw_adv_actions_list:
+                    adv_actions_tensor = torch.cat(raw_adv_actions_list, dim=0)  # (local_samples, adversary_action_dim) on GPU
+                    raw_adv_actions_list.clear()  # Clear after concatenation
+                    
+                    if self.is_distributed:
+                        # Gather from all ranks
+                        gathered = [torch.zeros_like(adv_actions_tensor) for _ in range(self.gpu_world_size)]
+                        torch.distributed.all_gather(gathered, adv_actions_tensor)
+                        
+                        # Concatenate all ranks' data on rank 0
+                        all_adv_actions = None
+                        if self.gpu_global_rank == 0:
+                            all_adv_actions = torch.cat(gathered, dim=0).cpu()
+                    else:
+                        all_adv_actions = adv_actions_tensor.cpu()
+                    
+                    # Save from rank 0 only (or non-distributed)
+                    if adv_action_h5_path and (not self.is_distributed or self.gpu_global_rank == 0):
+                        with h5py.File(adv_action_h5_path, "a") as f:
+                            group = f.create_group(f"iteration_{it}")
+                            group.create_dataset("adversary_actions", data=all_adv_actions.numpy())
+                            group.attrs["num_samples"] = all_adv_actions.shape[0]
 
             # Clear episode infos
             ep_infos.clear()
@@ -332,6 +377,29 @@ class MultiAgentRunner:
         # Save the final model after training
         if self.log_dir is not None and not self.disable_logs:
             self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"))
+        
+        # Gather and save any remaining raw adversary actions (all ranks participate in gather)
+        if raw_adv_actions_list and adv_action_h5_path:
+            adv_actions_tensor = torch.cat(raw_adv_actions_list, dim=0)  # On GPU
+            raw_adv_actions_list.clear()
+            
+            if self.is_distributed:
+                # Gather from all ranks
+                gathered = [torch.zeros_like(adv_actions_tensor) for _ in range(self.gpu_world_size)]
+                torch.distributed.all_gather(gathered, adv_actions_tensor)
+                
+                # Concatenate all ranks' data on rank 0
+                all_adv_actions = None
+                if self.gpu_global_rank == 0:
+                    all_adv_actions = torch.cat(gathered, dim=0).cpu()
+            else:
+                all_adv_actions = adv_actions_tensor.cpu()
+            
+            if adv_action_h5_path and (not self.is_distributed or self.gpu_global_rank == 0):
+                with h5py.File(adv_action_h5_path, "a") as f:
+                    group = f.create_group(f"iteration_{self.current_learning_iteration}")
+                    group.create_dataset("adversary_actions", data=all_adv_actions.numpy())
+                    group.attrs["num_samples"] = all_adv_actions.shape[0]
 
     def _act_both(self, obs: TensorDict) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Sample protagonist + adversary actions and concatenate for env.step()."""
