@@ -109,12 +109,6 @@ class OnPolicyRunner:
         
         for it in range(start_iter, tot_iter):
             start = time.time()
-            # Track randomized parameters over this rollout window (for logging)
-            param_sum = torch.zeros(16, dtype=torch.float, device=self.device)
-            param_sumsq = torch.zeros(16, dtype=torch.float, device=self.device)
-            param_min = torch.full((16,), float("inf"), dtype=torch.float, device=self.device)
-            param_max = torch.full((16,), float("-inf"), dtype=torch.float, device=self.device)
-            param_count = 0
             raw_params_list = []  # Store raw parameters before aggregation
 
             # Rollout
@@ -133,14 +127,8 @@ class OnPolicyRunner:
 
                     # Extract and track randomized parameters
                     randomized_params = self._extract_randomized_params()
-                    p = randomized_params.reshape(-1, randomized_params.shape[-1])
                     # Store raw parameters before aggregation (keep on GPU for distributed gather)
                     raw_params_list.append(randomized_params.detach())
-                    param_sum = param_sum + p.sum(dim=0)
-                    param_sumsq = param_sumsq + (p * p).sum(dim=0)
-                    param_min = torch.minimum(param_min, p.min(dim=0).values)
-                    param_max = torch.maximum(param_max, p.max(dim=0).values)
-                    param_count += int(p.shape[0])
 
                     # Book keeping
                     if self.log_dir is not None:
@@ -169,30 +157,40 @@ class OnPolicyRunner:
                             cur_ereward_sum[new_ids] = 0
                             cur_ireward_sum[new_ids] = 0
 
-                if self.is_distributed:
-                    # Aggregate randomized parameter stats across ranks
-                    torch.distributed.all_reduce(param_sum, op=torch.distributed.ReduceOp.SUM)
-                    torch.distributed.all_reduce(param_sumsq, op=torch.distributed.ReduceOp.SUM)
-                    torch.distributed.all_reduce(param_min, op=torch.distributed.ReduceOp.MIN)
-                    torch.distributed.all_reduce(param_max, op=torch.distributed.ReduceOp.MAX)
-                    param_count_t = torch.tensor(float(param_count), dtype=torch.float, device=self.device)
-                    torch.distributed.all_reduce(param_count_t, op=torch.distributed.ReduceOp.SUM)
-                    param_count = int(param_count_t.item())
-
-
                 stop = time.time()
                 collection_time = stop - start
                 start = stop
 
-                # Finalize randomized parameter stats for logging
-                if param_count > 0:
-                    param_mean = (param_sum / float(param_count)).detach().cpu().tolist()
-                    var_t = (param_sumsq / float(param_count)) - (param_sum / float(param_count)) * (param_sum / float(param_count))
-                    param_std = torch.sqrt(torch.clamp(var_t, min=0.0)).detach().cpu().tolist()
-                    param_min_v = param_min.detach().cpu().tolist()
-                    param_max_v = param_max.detach().cpu().tolist()
+                # Compute randomized parameter stats directly from collected batch
+                all_params_cpu = None  # Store for HDF5 saving
+                if raw_params_list:
+                    raw_params_tensor = torch.cat(raw_params_list, dim=0)  # (local_samples, 18) on GPU
+                    
+                    if self.is_distributed:
+                        # Gather from all ranks
+                        gathered = [torch.zeros_like(raw_params_tensor) for _ in range(self.gpu_world_size)]
+                        torch.distributed.all_gather(gathered, raw_params_tensor)
+                        # Concatenate all ranks' data
+                        if self.gpu_global_rank == 0:
+                            all_params = torch.cat(gathered, dim=0)
+                            all_params_cpu = all_params.cpu()  # Store for HDF5 saving
+                        else:
+                            all_params = None
+                    else:
+                        all_params = raw_params_tensor
+                        all_params_cpu = all_params.cpu()  # Store for HDF5 saving
+                    
+                    # Compute statistics from the batch (on rank 0 or non-distributed)
+                    if all_params is not None and all_params.shape[0] > 0:
+                        param_mean = all_params.mean(dim=0).cpu().tolist()
+                        param_std = all_params.std(dim=0).cpu().tolist()
+                        param_min_v = all_params.min(dim=0).values.cpu().tolist()
+                        param_max_v = all_params.max(dim=0).values.cpu().tolist()
+                    else:
+                        zeros = [0.0] * 18
+                        param_mean = param_std = param_min_v = param_max_v = zeros
                 else:
-                    zeros = [0.0] * 16
+                    zeros = [0.0] * 18
                     param_mean = param_std = param_min_v = param_max_v = zeros
 
                 # Compute returns
@@ -212,29 +210,14 @@ class OnPolicyRunner:
                     # Save model
                     if it % self.save_interval == 0:
                         self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
-                # Gather and concatenate raw parameters from all ranks, then save
-                if raw_params_list:
-                    raw_params_tensor = torch.cat(raw_params_list, dim=0)  # (local_samples, 16) on GPU
-                    raw_params_list.clear()  # Clear after concatenation
-                    
-                    if self.is_distributed:
-                        # Gather from all ranks
-                        gathered = [torch.zeros_like(raw_params_tensor) for _ in range(self.gpu_world_size)]
-                        torch.distributed.all_gather(gathered, raw_params_tensor)
-                        
-                        # Concatenate all ranks' data on rank 0
-                        all_params = None
-                        if self.gpu_global_rank == 0:
-                            all_params = torch.cat(gathered, dim=0).cpu()
-                    else:
-                        all_params = raw_params_tensor.cpu()
-                    
-                    # Save from rank 0 only (or non-distributed)
-                    if param_h5_path and (not self.is_distributed or self.gpu_global_rank == 0):
-                        with h5py.File(param_h5_path, "a") as f:
-                            group = f.create_group(f"iteration_{it}")
-                            group.create_dataset("raw_params", data=all_params.numpy())
-                            group.attrs["num_samples"] = all_params.shape[0]
+                # Save raw parameters to HDF5 (reuse gathered data from statistics computation)
+                if all_params_cpu is not None and param_h5_path:
+                    with h5py.File(param_h5_path, "a") as f:
+                        group = f.create_group(f"iteration_{it}")
+                        group.create_dataset("raw_params", data=all_params_cpu.numpy())
+                        group.attrs["num_samples"] = all_params_cpu.shape[0]
+                
+                raw_params_list.clear()  # Clear after processing
 
             # Clear episode infos
             ep_infos.clear()
@@ -582,7 +565,7 @@ class OnPolicyRunner:
 
     def _resolve_randomized_param_names(self) -> list[str]:
         cfg_names = self.cfg.get("randomized_param_names", None)
-        if isinstance(cfg_names, (list, tuple)) and len(cfg_names) == 16:
+        if isinstance(cfg_names, (list, tuple)) and len(cfg_names) == 18:
             return [str(x) for x in cfg_names]
         return [
             "robot_static_friction", "robot_dynamic_friction",
@@ -593,6 +576,7 @@ class OnPolicyRunner:
             "receptive_object_mass_scale", "table_mass_scale",
             "robot_joint_friction_scale", "robot_joint_armature_scale",
             "gripper_stiffness_scale", "gripper_damping_scale",
+            "osc_stiffness_scale", "osc_damping_scale",
         ]
 
     def _extract_randomized_params(self) -> torch.Tensor:
@@ -611,7 +595,7 @@ class OnPolicyRunner:
             num_envs = total_envs
             env_indices = slice(None)
         
-        params = torch.zeros((num_envs, 16), dtype=torch.float, device=self.device)
+        params = torch.zeros((num_envs, 18), dtype=torch.float, device=self.device)
         scene = self.env.unwrapped.scene
 
         robot = scene["robot"]
@@ -619,19 +603,19 @@ class OnPolicyRunner:
         params[:, 0] = materials[:, :, 0].to(self.device).mean(dim=1)
         params[:, 1] = materials[:, :, 1].to(self.device).mean(dim=1)
         current_masses = robot.root_physx_view.get_masses()[env_indices].to(self.device)
-        default_masses = robot.data.default_mass.to(self.device)
+        default_masses = robot.data.default_mass[env_indices].to(self.device)
         params[:, 8] = (current_masses / (default_masses + 1e-8)).mean(dim=1)
         current_friction = robot.data.joint_friction_coeff[env_indices].to(self.device)
-        default_friction = robot.data.default_joint_friction_coeff.to(self.device)
+        default_friction = robot.data.default_joint_friction_coeff[env_indices].to(self.device)
         params[:, 12] = (current_friction / (default_friction + 1e-8)).mean(dim=1)
         current_armature = robot.data.joint_armature[env_indices].to(self.device)
-        default_armature = robot.data.default_joint_armature.to(self.device)
+        default_armature = robot.data.default_joint_armature[env_indices].to(self.device)
         params[:, 13] = (current_armature / (default_armature + 1e-8)).mean(dim=1)
         current_stiffness = robot.data.joint_stiffness[env_indices].to(self.device)
-        default_stiffness = robot.data.default_joint_stiffness.to(self.device)
+        default_stiffness = robot.data.default_joint_stiffness[env_indices].to(self.device)
         params[:, 14] = (current_stiffness / (default_stiffness + 1e-8)).mean(dim=1)
         current_damping = robot.data.joint_damping[env_indices].to(self.device)
-        default_damping = robot.data.default_joint_damping.to(self.device)
+        default_damping = robot.data.default_joint_damping[env_indices].to(self.device)
         params[:, 15] = (current_damping / (default_damping + 1e-8)).mean(dim=1)
 
         insertive_obj = scene["insertive_object"]
@@ -639,7 +623,7 @@ class OnPolicyRunner:
         params[:, 2] = materials[:, :, 0].to(self.device).mean(dim=1)
         params[:, 3] = materials[:, :, 1].to(self.device).mean(dim=1)
         current_masses = insertive_obj.root_physx_view.get_masses()[env_indices].to(self.device)
-        default_masses = insertive_obj.data.default_mass.to(self.device)
+        default_masses = insertive_obj.data.default_mass[env_indices].to(self.device)
         params[:, 9] = (current_masses / (default_masses + 1e-8)).mean(dim=1)
 
         receptive_obj = scene["receptive_object"]
@@ -647,7 +631,7 @@ class OnPolicyRunner:
         params[:, 4] = materials[:, :, 0].to(self.device).mean(dim=1)
         params[:, 5] = materials[:, :, 1].to(self.device).mean(dim=1)
         current_masses = receptive_obj.root_physx_view.get_masses()[env_indices].to(self.device)
-        default_masses = receptive_obj.data.default_mass.to(self.device)
+        default_masses = receptive_obj.data.default_mass[env_indices].to(self.device)
         params[:, 10] = (current_masses / (default_masses + 1e-8)).mean(dim=1)
 
         table = scene["table"]
@@ -655,7 +639,26 @@ class OnPolicyRunner:
         params[:, 6] = materials[:, :, 0].to(self.device).mean(dim=1)
         params[:, 7] = materials[:, :, 1].to(self.device).mean(dim=1)
         current_masses = table.root_physx_view.get_masses()[env_indices].to(self.device)
-        default_masses = table.data.default_mass.to(self.device)
+        default_masses = table.data.default_mass[env_indices].to(self.device)
         params[:, 11] = (current_masses / (default_masses + 1e-8)).mean(dim=1)
+
+        osc_action_term = self.env.unwrapped.action_manager._terms.get("arm")
+        controller = osc_action_term._osc
+        # Get current stiffness gains (diagonal of motion_p_gains_task)
+        current_stiffness_diag = torch.diagonal(controller._motion_p_gains_task[env_indices], dim1=-2, dim2=-1)
+        # Default stiffness from config (6 values: xyz, rpy)
+        default_stiffness = torch.tensor(controller.cfg.motion_stiffness_task, device=self.device)
+        # Extract scale from xyz block (use first element or mean)
+        current_stiffness_xyz = current_stiffness_diag[:, 0]  # First xyz element
+        default_stiffness_xyz = default_stiffness[0]
+        params[:, 16] = current_stiffness_xyz / (default_stiffness_xyz + 1e-8)
+
+        # Get current damping gains and compute damping ratio
+        current_damping_diag = torch.diagonal(controller._motion_d_gains_task[env_indices], dim1=-2, dim2=-1)
+        # Damping = 2 * sqrt(stiffness) * damping_ratio, so damping_ratio = damping / (2 * sqrt(stiffness))
+        current_damping_ratio_xyz = current_damping_diag[:, 0] / (2 * current_stiffness_xyz.sqrt() + 1e-8)
+        default_damping_ratio = torch.tensor(controller.cfg.motion_damping_ratio_task, device=self.device)
+        default_damping_ratio_xyz = default_damping_ratio[0]
+        params[:, 17] = current_damping_ratio_xyz / (default_damping_ratio_xyz + 1e-8)
 
         return params

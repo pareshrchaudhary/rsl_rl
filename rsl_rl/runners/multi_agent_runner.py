@@ -53,8 +53,8 @@ class MultiAgentRunner:
                 f"env.num_actions ({self.env.num_actions}) must be > adversary_action_dim ({self.adversary_action_dim})."
             )
         self.protagonist_action_dim = int(self.env.num_actions - self.adversary_action_dim)
-        # Optional per-dimension names for adversary actions (used only for logging tags).
-        self.adversary_action_names = self._resolve_adversary_action_names()
+        # Resolve parameter names for logging
+        self.randomized_param_names = self._resolve_randomized_param_names()
 
         # Query observations from environment for algorithm construction
         obs = self.env.get_observations()
@@ -100,44 +100,6 @@ class MultiAgentRunner:
         self.current_learning_iteration = 0
         self.git_status_repos: list[str] = [str(rsl_rl.__file__)]
 
-    def _resolve_adversary_action_names(self) -> list[str]:
-        """Resolve human-readable adversary action names for logging.
-
-        Priority:
-        1) `train_cfg["adversary_action_names"]` if provided and matches `adversary_action_dim`
-        2) UWLab default names for the common 9-D adversary action
-        3) Fallback to `dim_{i}` names
-        """
-        cfg_names = self.cfg.get("adversary_action_names", None)
-        if isinstance(cfg_names, (list, tuple)) and len(cfg_names) == self.adversary_action_dim:
-            return [str(x) for x in cfg_names]
-
-        # UWLab adversarial reset parameter ordering (dim=9).
-        if self.adversary_action_dim == 9:
-            return [
-                "static_friction_abs",
-                "dynamic_friction_abs",
-                "mass_scale",
-                "joint_friction_scale",
-                "joint_armature_scale",
-                "gripper_stiffness_scale",
-                "gripper_damping_scale",
-                "osc_stiffness_scale",
-                "osc_damping_scale",
-            ]
-
-        return [f"dim_{i}" for i in range(self.adversary_action_dim)]
-
-    @staticmethod
-    def _sanitize_scalar_tag(s: str) -> str:
-        """Make a string safe for tensorboard/wandb/neptune scalar keys."""
-        s = str(s)
-        return "".join(c if (c.isalnum() or c in ("_", "-")) else "_" for c in s)
-
-    def _adv_action_tag(self, i: int) -> str:
-        name = self.adversary_action_names[i] if i < len(self.adversary_action_names) else f"dim_{i}"
-        return f"action_{i:02d}_{self._sanitize_scalar_tag(name)}"
-
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False) -> None:
         # Initialize writer
         self._prepare_logging_writer()
@@ -169,15 +131,15 @@ class MultiAgentRunner:
         # Start training
         start_iter = self.current_learning_iteration
         tot_iter = start_iter + num_learning_iterations
-        adv_action_h5_path = None
+        param_h5_path = None
         if self.log_dir is not None:
-            adv_action_h5_path = os.path.join(self.log_dir, "adversary_actions.h5")
+            param_h5_path = os.path.join(self.log_dir, "adversary_params.h5")
             # Initialize HDF5 file with metadata if it doesn't exist (only from rank 0)
-            if not self.disable_logs and not os.path.exists(adv_action_h5_path):
-                with h5py.File(adv_action_h5_path, "w") as f:
-                    f.attrs["action_names"] = [n.encode("utf-8") for n in self.adversary_action_names]
+            if not self.disable_logs and not os.path.exists(param_h5_path):
+                with h5py.File(param_h5_path, "w") as f:
+                    f.attrs["param_names"] = [n.encode("utf-8") for n in self.randomized_param_names]
         
-        raw_adv_actions_list = []  # Store raw adversary actions (for final save if needed)
+        raw_params_list = []  # Store raw parameters before aggregation
         for it in range(start_iter, tot_iter):
             start = time.time()
             # Reset adversary update window per rollout so we update exactly every k steps within num_steps_per_env.
@@ -194,46 +156,21 @@ class MultiAgentRunner:
             adv_updates = 0
             adv_loss_sum: dict[str, float] = {}
 
-            # Track adversary action stats over this rollout window (for logging).
-            adv_action_sum = torch.zeros(self.adversary_action_dim, dtype=torch.float, device=self.device)
-            adv_action_sumsq = torch.zeros(self.adversary_action_dim, dtype=torch.float, device=self.device)
-            adv_action_min = torch.full((self.adversary_action_dim,), float("inf"), dtype=torch.float, device=self.device)
-            adv_action_max = torch.full(
-                (self.adversary_action_dim,), float("-inf"), dtype=torch.float, device=self.device
-            )
-            # Number of samples per action dim (envs * steps, summed across the rollout window).
-            adv_action_count = 0
-            raw_adv_actions_list.clear()  # Clear for this iteration
-
             # Rollout
             for _ in range(self.num_steps_per_env):
                 # Agent stepping is inference-only; updates happen outside.
                 with torch.inference_mode():
                     # Sample actions from both agents (each uses its own obs_groups mapping).
                     _, adversary_actions, actions = self._act_both(obs)
-                    # In distributed training, slice to only include this rank's environments
-                    if self.is_distributed:
-                        total_envs = self.env.num_envs
-                        envs_per_rank = total_envs // self.gpu_world_size
-                        start_env = self.gpu_global_rank * envs_per_rank
-                        end_env = start_env + envs_per_rank if self.gpu_global_rank < self.gpu_world_size - 1 else total_envs
-                        adversary_actions = adversary_actions[start_env:end_env]
-                    # Store raw adversary actions before aggregation (keep on GPU for distributed gather)
-                    raw_adv_actions_list.append(adversary_actions.detach())
-                    adv_action_sum, adv_action_sumsq, adv_action_min, adv_action_max, adv_action_count = (
-                        self._update_adv_action_stats(
-                            adv_action_sum,
-                            adv_action_sumsq,
-                            adv_action_min,
-                            adv_action_max,
-                            adv_action_count,
-                            adversary_actions,
-                        )
-                    )
 
                     # Step the environment with combined actions.
                     obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
                     obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
+
+                    # Extract and track randomized parameters
+                    randomized_params = self._extract_randomized_params()
+                    # Store raw parameters before aggregation (keep on GPU for distributed gather)
+                    raw_params_list.append(randomized_params.detach())
 
                     # Adversary reward: regret over the last k protagonist step-mean rewards.
                     # regret = max(window) - mean(window), computed when window reaches k steps.
@@ -283,14 +220,6 @@ class MultiAgentRunner:
                 torch.distributed.all_reduce(batch_episode_reward_sum, op=torch.distributed.ReduceOp.SUM)
                 torch.distributed.all_reduce(batch_episode_count, op=torch.distributed.ReduceOp.SUM)
                 torch.distributed.all_reduce(batch_episode_reward_max, op=torch.distributed.ReduceOp.MAX)
-                # Aggregate adversary action stats across ranks for consistent logging.
-                torch.distributed.all_reduce(adv_action_sum, op=torch.distributed.ReduceOp.SUM)
-                torch.distributed.all_reduce(adv_action_sumsq, op=torch.distributed.ReduceOp.SUM)
-                torch.distributed.all_reduce(adv_action_min, op=torch.distributed.ReduceOp.MIN)
-                torch.distributed.all_reduce(adv_action_max, op=torch.distributed.ReduceOp.MAX)
-                adv_action_count_t = torch.tensor(float(adv_action_count), dtype=torch.float, device=self.device)
-                torch.distributed.all_reduce(adv_action_count_t, op=torch.distributed.ReduceOp.SUM)
-                adv_action_count = int(adv_action_count_t.item())
 
             # Convert to Python floats for logging
             batch_episode_count_f = float(batch_episode_count.item())
@@ -310,10 +239,37 @@ class MultiAgentRunner:
             collection_time = stop - start
             start = stop
 
-            # Finalize adversary action stats for logging.
-            adv_action_mean, adv_action_std, adv_action_min_v, adv_action_max_v = self._finalize_adv_action_stats(
-                adv_action_sum, adv_action_sumsq, adv_action_min, adv_action_max, adv_action_count
-            )
+            # Compute randomized parameter stats directly from collected batch
+            all_params_cpu = None  # Store for HDF5 saving
+            if raw_params_list:
+                raw_params_tensor = torch.cat(raw_params_list, dim=0)  # (local_samples, 18) on GPU
+                
+                if self.is_distributed:
+                    # Gather from all ranks
+                    gathered = [torch.zeros_like(raw_params_tensor) for _ in range(self.gpu_world_size)]
+                    torch.distributed.all_gather(gathered, raw_params_tensor)
+                    # Concatenate all ranks' data
+                    if self.gpu_global_rank == 0:
+                        all_params = torch.cat(gathered, dim=0)
+                        all_params_cpu = all_params.cpu()  # Store for HDF5 saving
+                    else:
+                        all_params = None
+                else:
+                    all_params = raw_params_tensor
+                    all_params_cpu = all_params.cpu()  # Store for HDF5 saving
+                
+                # Compute statistics from the batch (on rank 0 or non-distributed)
+                if all_params is not None and all_params.shape[0] > 0:
+                    param_mean = all_params.mean(dim=0).cpu().tolist()
+                    param_std = all_params.std(dim=0).cpu().tolist()
+                    param_min_v = all_params.min(dim=0).values.cpu().tolist()
+                    param_max_v = all_params.max(dim=0).values.cpu().tolist()
+                else:
+                    zeros = [0.0] * 18
+                    param_mean = param_std = param_min_v = param_max_v = zeros
+            else:
+                zeros = [0.0] * 18
+                param_mean = param_std = param_min_v = param_max_v = zeros
 
             # Compute returns (protagonist)
             with torch.inference_mode():
@@ -336,30 +292,14 @@ class MultiAgentRunner:
                     # Save model
                     if it % self.save_interval == 0:
                         self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
+                # Save raw parameters to HDF5 (reuse gathered data from statistics computation)
+                if all_params_cpu is not None and param_h5_path:
+                    with h5py.File(param_h5_path, "a") as f:
+                        group = f.create_group(f"iteration_{it}")
+                        group.create_dataset("raw_params", data=all_params_cpu.numpy())
+                        group.attrs["num_samples"] = all_params_cpu.shape[0]
                 
-                # Gather and concatenate raw adversary actions from all ranks, then save
-                if raw_adv_actions_list:
-                    adv_actions_tensor = torch.cat(raw_adv_actions_list, dim=0)  # (local_samples, adversary_action_dim) on GPU
-                    raw_adv_actions_list.clear()  # Clear after concatenation
-                    
-                    if self.is_distributed:
-                        # Gather from all ranks
-                        gathered = [torch.zeros_like(adv_actions_tensor) for _ in range(self.gpu_world_size)]
-                        torch.distributed.all_gather(gathered, adv_actions_tensor)
-                        
-                        # Concatenate all ranks' data on rank 0
-                        all_adv_actions = None
-                        if self.gpu_global_rank == 0:
-                            all_adv_actions = torch.cat(gathered, dim=0).cpu()
-                    else:
-                        all_adv_actions = adv_actions_tensor.cpu()
-                    
-                    # Save from rank 0 only (or non-distributed)
-                    if adv_action_h5_path and (not self.is_distributed or self.gpu_global_rank == 0):
-                        with h5py.File(adv_action_h5_path, "a") as f:
-                            group = f.create_group(f"iteration_{it}")
-                            group.create_dataset("adversary_actions", data=all_adv_actions.numpy())
-                            group.attrs["num_samples"] = all_adv_actions.shape[0]
+                raw_params_list.clear()  # Clear after processing
 
             # Clear episode infos
             ep_infos.clear()
@@ -378,28 +318,28 @@ class MultiAgentRunner:
         if self.log_dir is not None and not self.disable_logs:
             self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"))
         
-        # Gather and save any remaining raw adversary actions (all ranks participate in gather)
-        if raw_adv_actions_list and adv_action_h5_path:
-            adv_actions_tensor = torch.cat(raw_adv_actions_list, dim=0)  # On GPU
-            raw_adv_actions_list.clear()
+        # Gather and save any remaining raw parameters (all ranks participate in gather)
+        if raw_params_list and param_h5_path:
+            raw_params_tensor = torch.cat(raw_params_list, dim=0)  # On GPU
+            raw_params_list.clear()
             
             if self.is_distributed:
                 # Gather from all ranks
-                gathered = [torch.zeros_like(adv_actions_tensor) for _ in range(self.gpu_world_size)]
-                torch.distributed.all_gather(gathered, adv_actions_tensor)
+                gathered = [torch.zeros_like(raw_params_tensor) for _ in range(self.gpu_world_size)]
+                torch.distributed.all_gather(gathered, raw_params_tensor)
                 
                 # Concatenate all ranks' data on rank 0
-                all_adv_actions = None
+                all_params = None
                 if self.gpu_global_rank == 0:
-                    all_adv_actions = torch.cat(gathered, dim=0).cpu()
+                    all_params = torch.cat(gathered, dim=0).cpu()
             else:
-                all_adv_actions = adv_actions_tensor.cpu()
+                all_params = raw_params_tensor.cpu()
             
-            if adv_action_h5_path and (not self.is_distributed or self.gpu_global_rank == 0):
-                with h5py.File(adv_action_h5_path, "a") as f:
+            if param_h5_path and (not self.is_distributed or self.gpu_global_rank == 0):
+                with h5py.File(param_h5_path, "a") as f:
                     group = f.create_group(f"iteration_{self.current_learning_iteration}")
-                    group.create_dataset("adversary_actions", data=all_adv_actions.numpy())
-                    group.attrs["num_samples"] = all_adv_actions.shape[0]
+                    group.create_dataset("raw_params", data=all_params.numpy())
+                    group.attrs["num_samples"] = all_params.shape[0]
 
     def _act_both(self, obs: TensorDict) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Sample protagonist + adversary actions and concatenate for env.step()."""
@@ -407,47 +347,6 @@ class MultiAgentRunner:
         adversary_actions = self.alg_adversary.act(obs)
         actions = torch.cat([protagonist_actions, adversary_actions], dim=-1)
         return protagonist_actions, adversary_actions, actions
-
-    def _update_adv_action_stats(
-        self,
-        adv_action_sum: torch.Tensor,
-        adv_action_sumsq: torch.Tensor,
-        adv_action_min: torch.Tensor,
-        adv_action_max: torch.Tensor,
-        adv_action_count: int,
-        adversary_actions: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
-        """Accumulate adversary action stats across steps/envs (per action dimension)."""
-        # Flatten all leading dimensions into a single sample dimension, keep last dim as action dim.
-        a = adversary_actions.reshape(-1, adversary_actions.shape[-1])
-        adv_action_sum = adv_action_sum + a.sum(dim=0)
-        adv_action_sumsq = adv_action_sumsq + (a * a).sum(dim=0)
-        adv_action_min = torch.minimum(adv_action_min, a.min(dim=0).values)
-        adv_action_max = torch.maximum(adv_action_max, a.max(dim=0).values)
-        adv_action_count += int(a.shape[0])
-        return adv_action_sum, adv_action_sumsq, adv_action_min, adv_action_max, adv_action_count
-
-    def _finalize_adv_action_stats(
-        self,
-        adv_action_sum: torch.Tensor,
-        adv_action_sumsq: torch.Tensor,
-        adv_action_min: torch.Tensor,
-        adv_action_max: torch.Tensor,
-        adv_action_count: int,
-    ) -> tuple[list[float], list[float], list[float], list[float]]:
-        """Return per-dimension (mean, std, min, max) as Python lists."""
-        if adv_action_count <= 0:
-            zeros = [0.0 for _ in range(int(adv_action_sum.numel()))]
-            return zeros, zeros, zeros, zeros
-        mean_t = adv_action_sum / float(adv_action_count)
-        var_t = (adv_action_sumsq / float(adv_action_count)) - mean_t * mean_t
-        std_t = torch.sqrt(torch.clamp(var_t, min=0.0))
-        return (
-            mean_t.detach().cpu().tolist(),
-            std_t.detach().cpu().tolist(),
-            adv_action_min.detach().cpu().tolist(),
-            adv_action_max.detach().cpu().tolist(),
-        )
 
     def _compute_adversary_rewards(
         self,
@@ -575,18 +474,19 @@ class MultiAgentRunner:
         self.writer.add_scalar("Perf/collection time", locs["collection_time"], locs["it"])
         self.writer.add_scalar("Perf/learning_time", locs["learn_time"], locs["it"])
 
-        # Log adversary actions (aggregated over rollout window)
+        # Log adversary parameters (aggregated over rollout window)
         if (
-            "adv_action_mean" in locs
-            and "adv_action_std" in locs
-            and "adv_action_min_v" in locs
-            and "adv_action_max_v" in locs
+            "param_mean" in locs
+            and "param_std" in locs
+            and "param_min_v" in locs
+            and "param_max_v" in locs
         ):
-            # Per action dimension, aggregated over envs+steps within the rollout window.
             for i, (m, s, mn, mx) in enumerate(
-                zip(locs["adv_action_mean"], locs["adv_action_std"], locs["adv_action_min_v"], locs["adv_action_max_v"])
+                zip(locs["param_mean"], locs["param_std"], locs["param_min_v"], locs["param_max_v"])
             ):
-                tag = self._adv_action_tag(i)
+                name = self.randomized_param_names[i] if i < len(self.randomized_param_names) else f"dim_{i}"
+                sanitized = "".join(c if (c.isalnum() or c in ("_", "-")) else "_" for c in name)
+                tag = f"action_{i:02d}_{sanitized}"
                 self.writer.add_scalar(f"adversary_actions/{tag}/mean", float(m), locs["it"])
                 self.writer.add_scalar(f"adversary_actions/{tag}/std", float(s), locs["it"])
                 self.writer.add_scalar(f"adversary_actions/{tag}/min", float(mn), locs["it"])
@@ -825,6 +725,22 @@ class MultiAgentRunner:
         )
         return alg
 
+    def _resolve_randomized_param_names(self) -> list[str]:
+        cfg_names = self.cfg.get("randomized_param_names", None)
+        if isinstance(cfg_names, (list, tuple)) and len(cfg_names) == 18:
+            return [str(x) for x in cfg_names]
+        return [
+            "robot_static_friction", "robot_dynamic_friction",
+            "insertive_object_static_friction", "insertive_object_dynamic_friction",
+            "receptive_object_static_friction", "receptive_object_dynamic_friction",
+            "table_static_friction", "table_dynamic_friction",
+            "robot_mass_scale", "insertive_object_mass_scale",
+            "receptive_object_mass_scale", "table_mass_scale",
+            "robot_joint_friction_scale", "robot_joint_armature_scale",
+            "gripper_stiffness_scale", "gripper_damping_scale",
+            "osc_stiffness_scale", "osc_damping_scale",
+        ]
+
     def _prepare_logging_writer(self) -> None:
         """Prepare the logging writers."""
         if self.log_dir is not None and self.writer is None and not self.disable_logs:
@@ -858,3 +774,87 @@ class MultiAgentRunner:
                 self.writer = SummaryWriter(log_dir=self.log_dir, flush_secs=10)
             else:
                 raise ValueError("Logger type not found. Please choose 'neptune', 'wandb' or 'tensorboard'.")
+
+    def _extract_randomized_params(self) -> torch.Tensor:
+        # In distributed training, each rank should only extract from its assigned environments
+        # If env.num_envs returns total, we need to determine per-rank subset
+        total_envs = self.env.num_envs
+        if self.is_distributed:
+            # Calculate which environments belong to this rank
+            # Typically: rank R handles environments [R * (N/W) : (R+1) * (N/W)]
+            envs_per_rank = total_envs // self.gpu_world_size
+            start_env = self.gpu_global_rank * envs_per_rank
+            end_env = start_env + envs_per_rank if self.gpu_global_rank < self.gpu_world_size - 1 else total_envs
+            num_envs = end_env - start_env
+            env_indices = slice(start_env, end_env)
+        else:
+            num_envs = total_envs
+            env_indices = slice(None)
+        
+        params = torch.zeros((num_envs, 18), dtype=torch.float, device=self.device)
+        scene = self.env.unwrapped.scene
+
+        robot = scene["robot"]
+        materials = robot.root_physx_view.get_material_properties()[env_indices]
+        params[:, 0] = materials[:, :, 0].to(self.device).mean(dim=1)
+        params[:, 1] = materials[:, :, 1].to(self.device).mean(dim=1)
+        current_masses = robot.root_physx_view.get_masses()[env_indices].to(self.device)
+        default_masses = robot.data.default_mass[env_indices].to(self.device)
+        params[:, 8] = (current_masses / (default_masses + 1e-8)).mean(dim=1)
+        current_friction = robot.data.joint_friction_coeff[env_indices].to(self.device)
+        default_friction = robot.data.default_joint_friction_coeff[env_indices].to(self.device)
+        params[:, 12] = (current_friction / (default_friction + 1e-8)).mean(dim=1)
+        current_armature = robot.data.joint_armature[env_indices].to(self.device)
+        default_armature = robot.data.default_joint_armature[env_indices].to(self.device)
+        params[:, 13] = (current_armature / (default_armature + 1e-8)).mean(dim=1)
+        current_stiffness = robot.data.joint_stiffness[env_indices].to(self.device)
+        default_stiffness = robot.data.default_joint_stiffness[env_indices].to(self.device)
+        params[:, 14] = (current_stiffness / (default_stiffness + 1e-8)).mean(dim=1)
+        current_damping = robot.data.joint_damping[env_indices].to(self.device)
+        default_damping = robot.data.default_joint_damping[env_indices].to(self.device)
+        params[:, 15] = (current_damping / (default_damping + 1e-8)).mean(dim=1)
+
+        insertive_obj = scene["insertive_object"]
+        materials = insertive_obj.root_physx_view.get_material_properties()[env_indices]
+        params[:, 2] = materials[:, :, 0].to(self.device).mean(dim=1)
+        params[:, 3] = materials[:, :, 1].to(self.device).mean(dim=1)
+        current_masses = insertive_obj.root_physx_view.get_masses()[env_indices].to(self.device)
+        default_masses = insertive_obj.data.default_mass[env_indices].to(self.device)
+        params[:, 9] = (current_masses / (default_masses + 1e-8)).mean(dim=1)
+
+        receptive_obj = scene["receptive_object"]
+        materials = receptive_obj.root_physx_view.get_material_properties()[env_indices]
+        params[:, 4] = materials[:, :, 0].to(self.device).mean(dim=1)
+        params[:, 5] = materials[:, :, 1].to(self.device).mean(dim=1)
+        current_masses = receptive_obj.root_physx_view.get_masses()[env_indices].to(self.device)
+        default_masses = receptive_obj.data.default_mass[env_indices].to(self.device)
+        params[:, 10] = (current_masses / (default_masses + 1e-8)).mean(dim=1)
+
+        table = scene["table"]
+        materials = table.root_physx_view.get_material_properties()[env_indices]
+        params[:, 6] = materials[:, :, 0].to(self.device).mean(dim=1)
+        params[:, 7] = materials[:, :, 1].to(self.device).mean(dim=1)
+        current_masses = table.root_physx_view.get_masses()[env_indices].to(self.device)
+        default_masses = table.data.default_mass[env_indices].to(self.device)
+        params[:, 11] = (current_masses / (default_masses + 1e-8)).mean(dim=1)
+
+        osc_action_term = self.env.unwrapped.action_manager._terms.get("arm")
+        controller = osc_action_term._osc
+        # Get current stiffness gains (diagonal of motion_p_gains_task)
+        current_stiffness_diag = torch.diagonal(controller._motion_p_gains_task[env_indices], dim1=-2, dim2=-1)
+        # Default stiffness from config (6 values: xyz, rpy)
+        default_stiffness = torch.tensor(controller.cfg.motion_stiffness_task, device=self.device)
+        # Extract scale from xyz block (use first element or mean)
+        current_stiffness_xyz = current_stiffness_diag[:, 0]  # First xyz element
+        default_stiffness_xyz = default_stiffness[0]
+        params[:, 16] = current_stiffness_xyz / (default_stiffness_xyz + 1e-8)
+
+        # Get current damping gains and compute damping ratio
+        current_damping_diag = torch.diagonal(controller._motion_d_gains_task[env_indices], dim1=-2, dim2=-1)
+        # Damping = 2 * sqrt(stiffness) * damping_ratio, so damping_ratio = damping / (2 * sqrt(stiffness))
+        current_damping_ratio_xyz = current_damping_diag[:, 0] / (2 * current_stiffness_xyz.sqrt() + 1e-8)
+        default_damping_ratio = torch.tensor(controller.cfg.motion_damping_ratio_task, device=self.device)
+        default_damping_ratio_xyz = default_damping_ratio[0]
+        params[:, 17] = current_damping_ratio_xyz / (default_damping_ratio_xyz + 1e-8)
+
+        return params
