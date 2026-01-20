@@ -28,11 +28,11 @@ class MultiAgentRunner:
     def __init__(self, env: VecEnv, train_cfg: dict, log_dir: str | None = None, device: str = "cpu") -> None:
         print("Initializing MultiAgentRunner...")
         self.cfg = train_cfg
-        self.alg_protagonist_cfg_raw = train_cfg["protagonist_algorithm"]
+        self.alg_cfg = train_cfg["algorithm"]
         self.alg_adversary_cfg_raw = train_cfg["adversary_algorithm"]
-        self.policy_protagonist_cfg_raw = train_cfg["protagonist_policy"]
+        self.policy_cfg = train_cfg["policy"]
         self.policy_adversary_cfg_raw = train_cfg["adversary_policy"]
-        self.protagonist_obs_groups_raw = train_cfg["protagonist_obs_groups"]
+        self.obs_groups_raw = train_cfg["obs_groups"]
         self.adversary_obs_groups_raw = train_cfg["adversary_obs_groups"]
         self.device = device
         self.env = env
@@ -45,14 +45,14 @@ class MultiAgentRunner:
         self.adversary_update_every_k_steps = self.cfg["adversary_update_every_k_steps"]
         self.save_interval = self.cfg["save_interval"]
 
-        # Action split: protagonist controls robot, adversary controls last `adversary_action_dim` entries.
+        # Action split: policy controls robot, adversary controls last `adversary_action_dim` entries.
         # NOTE: For UWLab adversarial tasks this is 9 (see AdversaryActionCfg.action_dim).
         self.adversary_action_dim = int(self.cfg.get("adversary_action_dim", 9))
         if self.env.num_actions <= self.adversary_action_dim:
             raise ValueError(
                 f"env.num_actions ({self.env.num_actions}) must be > adversary_action_dim ({self.adversary_action_dim})."
             )
-        self.protagonist_action_dim = int(self.env.num_actions - self.adversary_action_dim)
+        self.policy_action_dim = int(self.env.num_actions - self.adversary_action_dim)
         # Resolve parameter names for logging
         self.randomized_param_names = self._resolve_randomized_param_names()
 
@@ -60,7 +60,7 @@ class MultiAgentRunner:
         obs = self.env.get_observations()
 
         # Resolve observation group mappings per agent.
-        self.protagonist_obs_groups = resolve_obs_groups(obs, dict(self.protagonist_obs_groups_raw), ["critic"])
+        self.cfg["obs_groups"] = resolve_obs_groups(obs, dict(self.obs_groups_raw), ["critic"])
 
         adversary_obs_groups_raw = dict(self.adversary_obs_groups_raw)
         if "critic" not in adversary_obs_groups_raw:
@@ -68,12 +68,12 @@ class MultiAgentRunner:
         self.adversary_obs_groups = resolve_obs_groups(obs, adversary_obs_groups_raw, ["critic"])
 
         # Create the algorithms (IPPO).
-        self.alg_protagonist = self._construct_agent_algorithm(
+        self.alg = self._construct_agent_algorithm(
             obs=obs,
-            obs_groups=self.protagonist_obs_groups,
-            policy_cfg=self.policy_protagonist_cfg_raw,
-            alg_cfg=self.alg_protagonist_cfg_raw,
-            action_dim=self.protagonist_action_dim,
+            obs_groups=self.cfg["obs_groups"],
+            policy_cfg=self.policy_cfg,
+            alg_cfg=self.alg_cfg,
+            action_dim=self.policy_action_dim,
             storage_horizon=self.num_steps_per_env,
         )
         self.alg_adversary = self._construct_agent_algorithm(
@@ -84,9 +84,6 @@ class MultiAgentRunner:
             action_dim=self.adversary_action_dim,
             storage_horizon=1,
         )
-        # Compatibility with OnPolicyRunner-style downstream code.
-        # The protagonist is the "main" policy (used for inference/export/etc.).
-        self.alg = self.alg_protagonist
 
         # Decide whether to disable logging
         # Note: We only log from the process with rank 0 (main process)
@@ -125,7 +122,7 @@ class MultiAgentRunner:
         # Ensure all parameters are in-synced
         if self.is_distributed:
             print(f"Synchronizing parameters for rank {self.gpu_global_rank}...")
-            self.alg_protagonist.broadcast_parameters()
+            self.alg.broadcast_parameters()
             self.alg_adversary.broadcast_parameters()
 
         # Start training
@@ -172,23 +169,23 @@ class MultiAgentRunner:
                     # Store raw parameters before aggregation (keep on GPU for distributed gather)
                     raw_params_list.append(randomized_params.detach())
 
-                    # Adversary reward: regret over the last k protagonist step-mean rewards.
+                    # Adversary reward: regret over the last k policy step-mean rewards.
                     # regret = max(window) - mean(window), computed when window reaches k steps.
                     adv_rewards, adv_step, adv_reward_window, do_adv_update, adv_regret = self._compute_adversary_rewards(
                         rewards, adv_step, adv_reward_window
                     )
 
                     # Process env step for both agents.
-                    self.alg_protagonist.process_env_step(obs, rewards, dones, extras)
+                    self.alg.process_env_step(obs, rewards, dones, extras)
                     # Bandit-style adversary: only store the transition on the update step.
                     if do_adv_update:
                         self.alg_adversary.process_env_step(obs, adv_rewards, dones, extras)
 
-                    # Book keeping (protagonist-centric, like OnPolicyRunner)
+                    # Book keeping (like OnPolicyRunner)
                     if self.log_dir is not None:
                         done_ids = (dones > 0).nonzero(as_tuple=False)
                         batch_episode_reward_sum, batch_episode_count, batch_episode_reward_max = (
-                            self._update_protagonist_rollout_bookkeeping(
+                            self._update_rollout_bookkeeping(
                                 extras,
                                 ep_infos,
                                 rewards,
@@ -271,12 +268,12 @@ class MultiAgentRunner:
                 zeros = [0.0] * 18
                 param_mean = param_std = param_min_v = param_max_v = zeros
 
-            # Compute returns (protagonist)
+            # Compute returns
             with torch.inference_mode():
-                self.alg_protagonist.compute_returns(obs)
+                self.alg.compute_returns(obs)
 
             # Update policy
-            loss_dict = self.alg_protagonist.update()
+            loss_dict = self.alg.update()
             adv_loss_dict_mean = None
             if adv_updates > 0:
                 adv_loss_dict_mean = {k: v / adv_updates for k, v in adv_loss_sum.items()}
@@ -342,11 +339,11 @@ class MultiAgentRunner:
                     group.attrs["num_samples"] = all_params.shape[0]
 
     def _act_both(self, obs: TensorDict) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Sample protagonist + adversary actions and concatenate for env.step()."""
-        protagonist_actions = self.alg_protagonist.act(obs)
+        """Sample policy + adversary actions and concatenate for env.step()."""
+        policy_actions = self.alg.act(obs)
         adversary_actions = self.alg_adversary.act(obs)
-        actions = torch.cat([protagonist_actions, adversary_actions], dim=-1)
-        return protagonist_actions, adversary_actions, actions
+        actions = torch.cat([policy_actions, adversary_actions], dim=-1)
+        return policy_actions, adversary_actions, actions
 
     def _compute_adversary_rewards(
         self,
@@ -381,7 +378,7 @@ class MultiAgentRunner:
         # Reset window/counter for next adversary interval.
         return adv_rewards, 0, [], True, regret
 
-    def _update_protagonist_rollout_bookkeeping(
+    def _update_rollout_bookkeeping(
         self,
         extras: dict,
         ep_infos: list,
@@ -452,14 +449,14 @@ class MultiAgentRunner:
                     self.writer.add_scalar("Episode/" + key, v, locs["it"])
                     ep_string += f"""{f"Mean episode {key}:":>{pad}} {v:.4f}\n"""
 
-        mean_std = self.alg_protagonist.policy.action_std.mean()
+        mean_std = self.alg.policy.action_std.mean()
         adv_mean_std = self.alg_adversary.policy.action_std.mean()
         fps = int(collection_size / (locs["collection_time"] + locs["learn_time"]))
 
         # Log losses
         for key, value in locs["loss_dict"].items():
             self.writer.add_scalar(f"Loss/{key}", value, locs["it"])
-        self.writer.add_scalar("Loss/learning_rate", self.alg_protagonist.learning_rate, locs["it"])
+        self.writer.add_scalar("Loss/learning_rate", self.alg.learning_rate, locs["it"])
         if locs.get("adv_loss_dict_mean") is not None:
             for key, value in locs["adv_loss_dict_mean"].items():
                 self.writer.add_scalar(f"Adversary/Loss/{key}", value, locs["it"])
@@ -575,10 +572,10 @@ class MultiAgentRunner:
         print(log_string)
 
     def save(self, path: str, infos: dict | None = None) -> None:
-        # Save protagonist in the exact same format as OnPolicyRunner for downstream compatibility.
+        # Save in the exact same format as OnPolicyRunner for downstream compatibility.
         saved_dict = {
-            "model_state_dict": self.alg_protagonist.policy.state_dict(),
-            "optimizer_state_dict": self.alg_protagonist.optimizer.state_dict(),
+            "model_state_dict": self.alg.policy.state_dict(),
+            "optimizer_state_dict": self.alg.optimizer.state_dict(),
             "iter": self.current_learning_iteration,
             "infos": infos,
         }
@@ -593,17 +590,17 @@ class MultiAgentRunner:
         # Backward compat: previously saved as nested dicts under "protagonist"/"adversary".
         if "protagonist" in loaded_dict and "adversary" in loaded_dict:
             p = loaded_dict["protagonist"]
-            resumed_training = self.alg_protagonist.policy.load_state_dict(p["model_state_dict"])
+            resumed_training = self.alg.policy.load_state_dict(p["model_state_dict"])
             if load_optimizer and resumed_training:
-                self.alg_protagonist.optimizer.load_state_dict(p["optimizer_state_dict"])
+                self.alg.optimizer.load_state_dict(p["optimizer_state_dict"])
             if resumed_training and "iter" in loaded_dict:
                 self.current_learning_iteration = loaded_dict["iter"]
             return loaded_dict.get("infos")
 
-        # Default: OnPolicyRunner-compatible protagonist keys.
-        resumed_training = self.alg_protagonist.policy.load_state_dict(loaded_dict["model_state_dict"])
+        # Default: OnPolicyRunner-compatible keys.
+        resumed_training = self.alg.policy.load_state_dict(loaded_dict["model_state_dict"])
         if load_optimizer and resumed_training:
-            self.alg_protagonist.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
+            self.alg.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
 
         if resumed_training and "iter" in loaded_dict:
             self.current_learning_iteration = loaded_dict["iter"]
@@ -612,16 +609,16 @@ class MultiAgentRunner:
     def get_inference_policy(self, device: str | None = None) -> callable:
         self.eval_mode()  # Switch to evaluation mode (e.g. for dropout)
         if device is not None:
-            self.alg_protagonist.policy.to(device)
-        return self.alg_protagonist.policy.act_inference
+            self.alg.policy.to(device)
+        return self.alg.policy.act_inference
 
     def train_mode(self) -> None:
         # PPO
-        self.alg_protagonist.policy.train()
+        self.alg.policy.train()
         self.alg_adversary.policy.train()
 
     def eval_mode(self) -> None:
-        self.alg_protagonist.policy.eval()
+        self.alg.policy.eval()
         self.alg_adversary.policy.eval()
 
     def add_git_repo_to_log(self, repo_file_path: str) -> None:
@@ -755,8 +752,8 @@ class MultiAgentRunner:
                 self.writer.log_config(
                     self.env.cfg,
                     self.cfg,
-                    {"protagonist": self.alg_protagonist_cfg_raw, "adversary": self.alg_adversary_cfg_raw},
-                    {"protagonist": self.policy_protagonist_cfg_raw, "adversary": self.policy_adversary_cfg_raw},
+                    {"policy": self.alg_cfg, "adversary": self.alg_adversary_cfg_raw},
+                    {"policy": self.policy_cfg, "adversary": self.policy_adversary_cfg_raw},
                 )
             elif self.logger_type == "wandb":
                 from rsl_rl.utils.wandb_utils import WandbSummaryWriter
@@ -765,8 +762,8 @@ class MultiAgentRunner:
                 self.writer.log_config(
                     self.env.cfg,
                     self.cfg,
-                    {"protagonist": self.alg_protagonist_cfg_raw, "adversary": self.alg_adversary_cfg_raw},
-                    {"protagonist": self.policy_protagonist_cfg_raw, "adversary": self.policy_adversary_cfg_raw},
+                    {"policy": self.alg_cfg, "adversary": self.alg_adversary_cfg_raw},
+                    {"policy": self.policy_cfg, "adversary": self.policy_adversary_cfg_raw},
                 )
             elif self.logger_type == "tensorboard":
                 from torch.utils.tensorboard import SummaryWriter
