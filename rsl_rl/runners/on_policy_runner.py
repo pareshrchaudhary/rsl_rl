@@ -19,6 +19,7 @@ from rsl_rl.algorithms import PPO
 from rsl_rl.env import VecEnv
 from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, resolve_rnd_config, resolve_symmetry_config
 from rsl_rl.utils import resolve_obs_groups, store_code_state
+from rsl_rl.utils.logger import resolve_randomized_param_names, extract_randomized_params
 
 
 class OnPolicyRunner:
@@ -37,6 +38,7 @@ class OnPolicyRunner:
         # Store training configuration
         self.num_steps_per_env = self.cfg["num_steps_per_env"]
         self.save_interval = self.cfg["save_interval"]
+        self.record_parameters = self.cfg.get("record_parameters", False)
 
         # Query observations from environment for algorithm construction
         obs = self.env.get_observations()
@@ -61,7 +63,7 @@ class OnPolicyRunner:
         self.git_status_repos = [rsl_rl.__file__]
 
         # Resolve parameter names for logging
-        self.randomized_param_names = self._resolve_randomized_param_names()
+        self.randomized_param_names = resolve_randomized_param_names(self.cfg)
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False) -> None:
         # Initialize writer
@@ -100,7 +102,7 @@ class OnPolicyRunner:
         start_iter = self.current_learning_iteration
         tot_iter = start_iter + num_learning_iterations
         param_h5_path = None
-        if self.log_dir is not None:
+        if self.log_dir is not None and self.record_parameters:
             param_h5_path = os.path.join(self.log_dir, "raw_params.h5")
             # Initialize HDF5 file with metadata if it doesn't exist (only from rank 0)
             if not self.disable_logs and not os.path.exists(param_h5_path):
@@ -126,7 +128,9 @@ class OnPolicyRunner:
                     intrinsic_rewards = self.alg.intrinsic_rewards if self.alg.rnd else None
 
                     # Extract and track randomized parameters
-                    randomized_params = self._extract_randomized_params()
+                    randomized_params = extract_randomized_params(
+                        self.env, self.device, self.is_distributed, self.gpu_world_size, self.gpu_global_rank
+                    )
                     # Store raw parameters before aggregation (keep on GPU for distributed gather)
                     raw_params_list.append(randomized_params.detach())
 
@@ -211,7 +215,7 @@ class OnPolicyRunner:
                     if it % self.save_interval == 0:
                         self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
                 # Save raw parameters to HDF5 (reuse gathered data from statistics computation)
-                if all_params_cpu is not None and param_h5_path:
+                if self.record_parameters and all_params_cpu is not None and param_h5_path:
                     with h5py.File(param_h5_path, "a") as f:
                         group = f.create_group(f"iteration_{it}")
                         group.create_dataset("raw_params", data=all_params_cpu.numpy())
@@ -235,7 +239,7 @@ class OnPolicyRunner:
             self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"))
         
         # Gather and save any remaining raw parameters (all ranks participate in gather)
-        if raw_params_list and param_h5_path:
+        if self.record_parameters and raw_params_list and param_h5_path:
             raw_params_tensor = torch.cat(raw_params_list, dim=0)  # On GPU
             raw_params_list.clear()
             
@@ -251,7 +255,7 @@ class OnPolicyRunner:
             else:
                 all_params = raw_params_tensor.cpu()
             
-            if param_h5_path and (not self.is_distributed or self.gpu_global_rank == 0):
+            if param_h5_path and all_params is not None and (not self.is_distributed or self.gpu_global_rank == 0):
                 with h5py.File(param_h5_path, "a") as f:
                     group = f.create_group(f"iteration_{self.current_learning_iteration}")
                     group.create_dataset("raw_params", data=all_params.numpy())
@@ -562,103 +566,3 @@ class OnPolicyRunner:
                 self.writer = SummaryWriter(log_dir=self.log_dir, flush_secs=10)
             else:
                 raise ValueError("Logger type not found. Please choose 'neptune', 'wandb' or 'tensorboard'.")
-
-    def _resolve_randomized_param_names(self) -> list[str]:
-        cfg_names = self.cfg.get("randomized_param_names", None)
-        if isinstance(cfg_names, (list, tuple)) and len(cfg_names) == 18:
-            return [str(x) for x in cfg_names]
-        return [
-            "robot_static_friction", "robot_dynamic_friction",
-            "insertive_object_static_friction", "insertive_object_dynamic_friction",
-            "receptive_object_static_friction", "receptive_object_dynamic_friction",
-            "table_static_friction", "table_dynamic_friction",
-            "robot_mass_scale", "insertive_object_mass_scale",
-            "receptive_object_mass_scale", "table_mass_scale",
-            "robot_joint_friction_scale", "robot_joint_armature_scale",
-            "gripper_stiffness_scale", "gripper_damping_scale",
-            "osc_stiffness_scale", "osc_damping_scale",
-        ]
-
-    def _extract_randomized_params(self) -> torch.Tensor:
-        # In distributed training, each rank should only extract from its assigned environments
-        # If env.num_envs returns total, we need to determine per-rank subset
-        total_envs = self.env.num_envs
-        if self.is_distributed:
-            # Calculate which environments belong to this rank
-            # Typically: rank R handles environments [R * (N/W) : (R+1) * (N/W)]
-            envs_per_rank = total_envs // self.gpu_world_size
-            start_env = self.gpu_global_rank * envs_per_rank
-            end_env = start_env + envs_per_rank if self.gpu_global_rank < self.gpu_world_size - 1 else total_envs
-            num_envs = end_env - start_env
-            env_indices = slice(start_env, end_env)
-        else:
-            num_envs = total_envs
-            env_indices = slice(None)
-        
-        params = torch.zeros((num_envs, 18), dtype=torch.float, device=self.device)
-        scene = self.env.unwrapped.scene
-
-        robot = scene["robot"]
-        materials = robot.root_physx_view.get_material_properties()[env_indices]
-        params[:, 0] = materials[:, :, 0].to(self.device).mean(dim=1)
-        params[:, 1] = materials[:, :, 1].to(self.device).mean(dim=1)
-        current_masses = robot.root_physx_view.get_masses()[env_indices].to(self.device)
-        default_masses = robot.data.default_mass[env_indices].to(self.device)
-        params[:, 8] = (current_masses / (default_masses + 1e-8)).mean(dim=1)
-        current_friction = robot.data.joint_friction_coeff[env_indices].to(self.device)
-        default_friction = robot.data.default_joint_friction_coeff[env_indices].to(self.device)
-        params[:, 12] = (current_friction / (default_friction + 1e-8)).mean(dim=1)
-        current_armature = robot.data.joint_armature[env_indices].to(self.device)
-        default_armature = robot.data.default_joint_armature[env_indices].to(self.device)
-        params[:, 13] = (current_armature / (default_armature + 1e-8)).mean(dim=1)
-        current_stiffness = robot.data.joint_stiffness[env_indices].to(self.device)
-        default_stiffness = robot.data.default_joint_stiffness[env_indices].to(self.device)
-        params[:, 14] = (current_stiffness / (default_stiffness + 1e-8)).mean(dim=1)
-        current_damping = robot.data.joint_damping[env_indices].to(self.device)
-        default_damping = robot.data.default_joint_damping[env_indices].to(self.device)
-        params[:, 15] = (current_damping / (default_damping + 1e-8)).mean(dim=1)
-
-        insertive_obj = scene["insertive_object"]
-        materials = insertive_obj.root_physx_view.get_material_properties()[env_indices]
-        params[:, 2] = materials[:, :, 0].to(self.device).mean(dim=1)
-        params[:, 3] = materials[:, :, 1].to(self.device).mean(dim=1)
-        current_masses = insertive_obj.root_physx_view.get_masses()[env_indices].to(self.device)
-        default_masses = insertive_obj.data.default_mass[env_indices].to(self.device)
-        params[:, 9] = (current_masses / (default_masses + 1e-8)).mean(dim=1)
-
-        receptive_obj = scene["receptive_object"]
-        materials = receptive_obj.root_physx_view.get_material_properties()[env_indices]
-        params[:, 4] = materials[:, :, 0].to(self.device).mean(dim=1)
-        params[:, 5] = materials[:, :, 1].to(self.device).mean(dim=1)
-        current_masses = receptive_obj.root_physx_view.get_masses()[env_indices].to(self.device)
-        default_masses = receptive_obj.data.default_mass[env_indices].to(self.device)
-        params[:, 10] = (current_masses / (default_masses + 1e-8)).mean(dim=1)
-
-        table = scene["table"]
-        materials = table.root_physx_view.get_material_properties()[env_indices]
-        params[:, 6] = materials[:, :, 0].to(self.device).mean(dim=1)
-        params[:, 7] = materials[:, :, 1].to(self.device).mean(dim=1)
-        current_masses = table.root_physx_view.get_masses()[env_indices].to(self.device)
-        default_masses = table.data.default_mass[env_indices].to(self.device)
-        params[:, 11] = (current_masses / (default_masses + 1e-8)).mean(dim=1)
-
-        osc_action_term = self.env.unwrapped.action_manager._terms.get("arm")
-        controller = osc_action_term._osc
-        # Get current stiffness gains (diagonal of motion_p_gains_task)
-        current_stiffness_diag = torch.diagonal(controller._motion_p_gains_task[env_indices], dim1=-2, dim2=-1)
-        # Default stiffness from config (6 values: xyz, rpy)
-        default_stiffness = torch.tensor(controller.cfg.motion_stiffness_task, device=self.device)
-        # Extract scale from xyz block (use first element or mean)
-        current_stiffness_xyz = current_stiffness_diag[:, 0]  # First xyz element
-        default_stiffness_xyz = default_stiffness[0]
-        params[:, 16] = current_stiffness_xyz / (default_stiffness_xyz + 1e-8)
-
-        # Get current damping gains and compute damping ratio
-        current_damping_diag = torch.diagonal(controller._motion_d_gains_task[env_indices], dim1=-2, dim2=-1)
-        # Damping = 2 * sqrt(stiffness) * damping_ratio, so damping_ratio = damping / (2 * sqrt(stiffness))
-        current_damping_ratio_xyz = current_damping_diag[:, 0] / (2 * current_stiffness_xyz.sqrt() + 1e-8)
-        default_damping_ratio = torch.tensor(controller.cfg.motion_damping_ratio_task, device=self.device)
-        default_damping_ratio_xyz = default_damping_ratio[0]
-        params[:, 17] = current_damping_ratio_xyz / (default_damping_ratio_xyz + 1e-8)
-
-        return params

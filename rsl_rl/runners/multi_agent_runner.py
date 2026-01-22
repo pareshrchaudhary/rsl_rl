@@ -20,6 +20,7 @@ from rsl_rl.algorithms.simple_ppo import SimplePPO
 from rsl_rl.env import VecEnv
 from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, resolve_symmetry_config
 from rsl_rl.utils import resolve_obs_groups, store_code_state
+from rsl_rl.utils.logger import resolve_randomized_param_names, extract_randomized_params, log_multi_agent
 
 
 class MultiAgentRunner:
@@ -44,6 +45,7 @@ class MultiAgentRunner:
         self.num_steps_per_env = self.cfg["num_steps_per_env"]
         self.adversary_update_every_k_steps = self.cfg["adversary_update_every_k_steps"]
         self.save_interval = self.cfg["save_interval"]
+        self.record_parameters = self.cfg.get("record_parameters", False)
 
         # Action split: policy controls robot, adversary controls last `adversary_action_dim` entries.
         # NOTE: For UWLab adversarial tasks this is 9 (see AdversaryActionCfg.action_dim).
@@ -54,7 +56,7 @@ class MultiAgentRunner:
             )
         self.policy_action_dim = int(self.env.num_actions - self.adversary_action_dim)
         # Resolve parameter names for logging
-        self.randomized_param_names = self._resolve_randomized_param_names()
+        self.randomized_param_names = resolve_randomized_param_names(self.cfg)
 
         # Query observations from environment for algorithm construction
         obs = self.env.get_observations()
@@ -98,7 +100,6 @@ class MultiAgentRunner:
         self.git_status_repos: list[str] = [str(rsl_rl.__file__)]
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False) -> None:
-        # Initialize writer
         self._prepare_logging_writer()
 
         # Randomize initial episode lengths (for exploration)
@@ -129,7 +130,7 @@ class MultiAgentRunner:
         start_iter = self.current_learning_iteration
         tot_iter = start_iter + num_learning_iterations
         param_h5_path = None
-        if self.log_dir is not None:
+        if self.log_dir is not None and self.record_parameters:
             param_h5_path = os.path.join(self.log_dir, "adversary_params.h5")
             # Initialize HDF5 file with metadata if it doesn't exist (only from rank 0)
             if not self.disable_logs and not os.path.exists(param_h5_path):
@@ -153,6 +154,13 @@ class MultiAgentRunner:
             adv_updates = 0
             adv_loss_sum: dict[str, float] = {}
 
+            # Extract parameters once per iteration
+            randomized_params = extract_randomized_params(
+                self.env, self.device, self.is_distributed, self.gpu_world_size, self.gpu_global_rank
+            )
+            # Store raw parameters (keep on GPU for distributed gather)
+            raw_params_list.append(randomized_params.detach())
+
             # Rollout
             for _ in range(self.num_steps_per_env):
                 # Agent stepping is inference-only; updates happen outside.
@@ -163,11 +171,6 @@ class MultiAgentRunner:
                     # Step the environment with combined actions.
                     obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
                     obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
-
-                    # Extract and track randomized parameters
-                    randomized_params = self._extract_randomized_params()
-                    # Store raw parameters before aggregation (keep on GPU for distributed gather)
-                    raw_params_list.append(randomized_params.detach())
 
                     # Adversary reward: regret over the last k policy step-mean rewards.
                     # regret = max(window) - mean(window), computed when window reaches k steps.
@@ -239,7 +242,8 @@ class MultiAgentRunner:
             # Compute randomized parameter stats directly from collected batch
             all_params_cpu = None  # Store for HDF5 saving
             if raw_params_list:
-                raw_params_tensor = torch.cat(raw_params_list, dim=0)  # (local_samples, 18) on GPU
+                # Extract the single parameter tensor (one per environment per iteration)
+                raw_params_tensor = raw_params_list[0]  # (num_envs, 18) on GPU
                 
                 if self.is_distributed:
                     # Gather from all ranks
@@ -285,12 +289,30 @@ class MultiAgentRunner:
             if self.log_dir is not None:
                 # Log information (only from rank 0)
                 if not self.disable_logs:
-                    self.log(locals())
+                    # Update total timesteps and time
+                    collection_size = self.num_steps_per_env * self.env.num_envs * self.gpu_world_size
+                    self.tot_timesteps += collection_size
+                    self.tot_time += collection_time + learn_time
+                    # Log metrics
+                    log_multi_agent(
+                        writer=self.writer,
+                        device=self.device,
+                        num_steps_per_env=self.num_steps_per_env,
+                        num_envs=self.env.num_envs,
+                        gpu_world_size=self.gpu_world_size,
+                        alg=self.alg,
+                        alg_adversary=self.alg_adversary,
+                        randomized_param_names=self.randomized_param_names,
+                        logger_type=self.logger_type,
+                        tot_timesteps=self.tot_timesteps,
+                        tot_time=self.tot_time,
+                        locs=locals(),
+                    )
                     # Save model
                     if it % self.save_interval == 0:
                         self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
                 # Save raw parameters to HDF5 (reuse gathered data from statistics computation)
-                if all_params_cpu is not None and param_h5_path:
+                if self.record_parameters and all_params_cpu is not None and param_h5_path:
                     with h5py.File(param_h5_path, "a") as f:
                         group = f.create_group(f"iteration_{it}")
                         group.create_dataset("raw_params", data=all_params_cpu.numpy())
@@ -316,8 +338,8 @@ class MultiAgentRunner:
             self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"))
         
         # Gather and save any remaining raw parameters (all ranks participate in gather)
-        if raw_params_list and param_h5_path:
-            raw_params_tensor = torch.cat(raw_params_list, dim=0)  # On GPU
+        if self.record_parameters and raw_params_list and param_h5_path:
+            raw_params_tensor = raw_params_list[0]  # Single tensor (num_envs, 18) on GPU
             raw_params_list.clear()
             
             if self.is_distributed:
@@ -332,7 +354,7 @@ class MultiAgentRunner:
             else:
                 all_params = raw_params_tensor.cpu()
             
-            if param_h5_path and (not self.is_distributed or self.gpu_global_rank == 0):
+            if param_h5_path and all_params is not None and (not self.is_distributed or self.gpu_global_rank == 0):
                 with h5py.File(param_h5_path, "a") as f:
                     group = f.create_group(f"iteration_{self.current_learning_iteration}")
                     group.create_dataset("raw_params", data=all_params.numpy())
@@ -415,164 +437,7 @@ class MultiAgentRunner:
         cur_episode_length[done_ids] = 0
         return batch_episode_reward_sum, batch_episode_count, batch_episode_reward_max
 
-    def log(self, locs: dict, width: int = 80, pad: int = 35) -> None:
-        assert self.writer is not None
-        # Compute the collection size
-        collection_size = self.num_steps_per_env * self.env.num_envs * self.gpu_world_size
-        # Update total time-steps and time
-        self.tot_timesteps += collection_size
-        self.tot_time += locs["collection_time"] + locs["learn_time"]
-        iteration_time = locs["collection_time"] + locs["learn_time"]
-
-        # Log episode information
-        ep_string = ""
-        if locs["ep_infos"]:
-            for key in locs["ep_infos"][0]:
-                infotensor = torch.tensor([], device=self.device)
-                for ep_info in locs["ep_infos"]:
-                    # Handle scalar and zero dimensional tensor infos
-                    if key not in ep_info:
-                        continue
-                    if not isinstance(ep_info[key], torch.Tensor):
-                        ep_info[key] = torch.Tensor([ep_info[key]])
-                    if len(ep_info[key].shape) == 0:
-                        ep_info[key] = ep_info[key].unsqueeze(0)
-                    infotensor = torch.cat((infotensor, ep_info[key].to(self.device)))
-                value = torch.mean(infotensor)
-                # Log to logger and terminal
-                if "/" in key:
-                    v = float(value.item())
-                    self.writer.add_scalar(key, v, locs["it"])
-                    ep_string += f"""{f"{key}:":>{pad}} {v:.4f}\n"""
-                else:
-                    v = float(value.item())
-                    self.writer.add_scalar("Episode/" + key, v, locs["it"])
-                    ep_string += f"""{f"Mean episode {key}:":>{pad}} {v:.4f}\n"""
-
-        mean_std = self.alg.policy.action_std.mean()
-        adv_mean_std = self.alg_adversary.policy.action_std.mean()
-        fps = int(collection_size / (locs["collection_time"] + locs["learn_time"]))
-
-        # Log losses
-        for key, value in locs["loss_dict"].items():
-            self.writer.add_scalar(f"Loss/{key}", value, locs["it"])
-        self.writer.add_scalar("Loss/learning_rate", self.alg.learning_rate, locs["it"])
-        if locs.get("adv_loss_dict_mean") is not None:
-            for key, value in locs["adv_loss_dict_mean"].items():
-                self.writer.add_scalar(f"Adversary/Loss/{key}", value, locs["it"])
-            self.writer.add_scalar("Adversary/Loss/learning_rate", self.alg_adversary.learning_rate, locs["it"])
-
-        # Log noise std
-        self.writer.add_scalar("Policy/mean_noise_std", mean_std.item(), locs["it"])
-        self.writer.add_scalar("Adversary/mean_noise_std", adv_mean_std.item(), locs["it"])
-
-        # Log performance
-        self.writer.add_scalar("Perf/total_fps", fps, locs["it"])
-        self.writer.add_scalar("Perf/collection time", locs["collection_time"], locs["it"])
-        self.writer.add_scalar("Perf/learning_time", locs["learn_time"], locs["it"])
-
-        # Log adversary parameters (aggregated over rollout window)
-        if (
-            "param_mean" in locs
-            and "param_std" in locs
-            and "param_min_v" in locs
-            and "param_max_v" in locs
-        ):
-            for i, (m, s, mn, mx) in enumerate(
-                zip(locs["param_mean"], locs["param_std"], locs["param_min_v"], locs["param_max_v"])
-            ):
-                name = self.randomized_param_names[i] if i < len(self.randomized_param_names) else f"dim_{i}"
-                sanitized = "".join(c if (c.isalnum() or c in ("_", "-")) else "_" for c in name)
-                tag = f"action_{i:02d}_{sanitized}"
-                self.writer.add_scalar(f"adversary_actions/{tag}/mean", float(m), locs["it"])
-                self.writer.add_scalar(f"adversary_actions/{tag}/std", float(s), locs["it"])
-                self.writer.add_scalar(f"adversary_actions/{tag}/min", float(mn), locs["it"])
-                self.writer.add_scalar(f"adversary_actions/{tag}/max", float(mx), locs["it"])
-
-        # Log rollout-batch metrics (independent of completed episodes)
-        if (
-            "batch_episode_count" in locs
-            and "max_batch_total_reward" in locs
-            and "mean_batch_total_reward" in locs
-            and "regret" in locs
-            and locs["batch_episode_count"] > 0
-        ):
-            self.writer.add_scalar("Metrics/max_batch_total_reward", locs["max_batch_total_reward"], locs["it"])
-            self.writer.add_scalar("Metrics/mean_batch_total_reward", locs["mean_batch_total_reward"], locs["it"])
-            self.writer.add_scalar("Metrics/regret", locs["regret"], locs["it"])
-
-        # Log training
-        if len(locs["rewbuffer"]) > 0:
-            # Everything else
-            self.writer.add_scalar("Train/mean_reward", statistics.mean(locs["rewbuffer"]), locs["it"])
-            self.writer.add_scalar("Train/mean_episode_length", statistics.mean(locs["lenbuffer"]), locs["it"])
-            if "adv_rewbuffer" in locs and len(locs["adv_rewbuffer"]) > 0:
-                self.writer.add_scalar("Adversary/mean_reward", statistics.mean(locs["adv_rewbuffer"]), locs["it"])
-            if self.logger_type != "wandb":  # wandb does not support non-integer x-axis logging
-                self.writer.add_scalar("Train/mean_reward/time", statistics.mean(locs["rewbuffer"]), self.tot_time)
-                self.writer.add_scalar(
-                    "Train/mean_episode_length/time", statistics.mean(locs["lenbuffer"]), self.tot_time
-                )
-
-        str = f" \033[1m Learning iteration {locs['it']}/{locs['tot_iter']} \033[0m "
-
-        if len(locs["rewbuffer"]) > 0:
-            log_string = (
-                f"""{"#" * width}\n"""
-                f"""{str.center(width, " ")}\n\n"""
-                f"""{"Computation:":>{pad}} {fps:.0f} steps/s (collection: {locs["collection_time"]:.3f}s, learning {
-                    locs["learn_time"]:.3f}s)\n"""
-                f"""{"Mean action noise std:":>{pad}} {mean_std.item():.2f}\n"""
-            )
-            # Print losses
-            for key, value in locs["loss_dict"].items():
-                log_string += f"""{f"Mean {key} loss:":>{pad}} {value:.4f}\n"""
-            if locs.get("adv_loss_dict_mean") is not None:
-                for key, value in locs["adv_loss_dict_mean"].items():
-                    log_string += f"""{f"Mean adversary {key} loss:":>{pad}} {value:.4f}\n"""
-            log_string += f"""{"Mean reward:":>{pad}} {statistics.mean(locs["rewbuffer"]):.2f}\n"""
-            if "adv_rewbuffer" in locs and len(locs["adv_rewbuffer"]) > 0:
-                log_string += f"""{f"Mean adversary reward:":>{pad}} {statistics.mean(locs["adv_rewbuffer"]):.2f}\n"""
-            # Print regret metrics
-            log_string += f"""{"Max batch reward:":>{pad}} {locs["max_batch_total_reward"]:.2f}\n"""
-            log_string += f"""{"Regret:":>{pad}} {locs["regret"]:.2f}\n"""
-            # Print episode information
-            log_string += f"""{"Mean episode length:":>{pad}} {statistics.mean(locs["lenbuffer"]):.2f}\n"""
-        else:
-            log_string = (
-                f"""{"#" * width}\n"""
-                f"""{str.center(width, " ")}\n\n"""
-                f"""{"Computation:":>{pad}} {fps:.0f} steps/s (collection: {locs["collection_time"]:.3f}s, learning {
-                    locs["learn_time"]:.3f}s)\n"""
-                f"""{"Mean action noise std:":>{pad}} {mean_std.item():.2f}\n"""
-            )
-            for key, value in locs["loss_dict"].items():
-                log_string += f"""{f"{key}:":>{pad}} {value:.4f}\n"""
-            if "max_batch_total_reward" in locs and "regret" in locs:
-                log_string += f"""{"Max batch reward:":>{pad}} {locs["max_batch_total_reward"]:.2f}\n"""
-                log_string += f"""{"Regret:":>{pad}} {locs["regret"]:.2f}\n"""
-
-        log_string += ep_string
-        log_string += (
-            f"""{"-" * width}\n"""
-            f"""{"Total timesteps:":>{pad}} {self.tot_timesteps}\n"""
-            f"""{"Iteration time:":>{pad}} {iteration_time:.2f}s\n"""
-            f"""{"Time elapsed:":>{pad}} {time.strftime("%H:%M:%S", time.gmtime(self.tot_time))}\n"""
-            f"""{"ETA:":>{pad}} {
-                time.strftime(
-                    "%H:%M:%S",
-                    time.gmtime(
-                        self.tot_time
-                        / (locs["it"] - locs["start_iter"] + 1)
-                        * (locs["start_iter"] + locs["num_learning_iterations"] - locs["it"])
-                    ),
-                )
-            }\n"""
-        )
-        print(log_string)
-
     def save(self, path: str, infos: dict | None = None) -> None:
-        # Save in the exact same format as OnPolicyRunner for downstream compatibility.
         saved_dict = {
             "model_state_dict": self.alg.policy.state_dict(),
             "optimizer_state_dict": self.alg.optimizer.state_dict(),
@@ -581,29 +446,37 @@ class MultiAgentRunner:
         }
         torch.save(saved_dict, path)
 
+        adversary_path = path.replace(".pt", "_adversary.pt")
+        adversary_saved_dict = {
+            "model_state_dict": self.alg_adversary.policy.state_dict(),
+            "optimizer_state_dict": self.alg_adversary.optimizer.state_dict(),
+            "iter": self.current_learning_iteration,
+            "infos": infos,
+        }
+        torch.save(adversary_saved_dict, adversary_path)
+
         # Upload model to external logging service
         if self.logger_type in ["neptune", "wandb"] and not self.disable_logs:
             self.writer.save_model(path, self.current_learning_iteration) # type: ignore
+            self.writer.save_model(adversary_path, self.current_learning_iteration) # type: ignore
 
     def load(self, path: str, load_optimizer: bool = True, map_location: str | None = None) -> dict:
         loaded_dict = torch.load(path, weights_only=False, map_location=map_location)
-        # Backward compat: previously saved as nested dicts under "protagonist"/"adversary".
-        if "protagonist" in loaded_dict and "adversary" in loaded_dict:
-            p = loaded_dict["protagonist"]
-            resumed_training = self.alg.policy.load_state_dict(p["model_state_dict"])
-            if load_optimizer and resumed_training:
-                self.alg.optimizer.load_state_dict(p["optimizer_state_dict"])
-            if resumed_training and "iter" in loaded_dict:
-                self.current_learning_iteration = loaded_dict["iter"]
-            return loaded_dict.get("infos")
-
-        # Default: OnPolicyRunner-compatible keys.
         resumed_training = self.alg.policy.load_state_dict(loaded_dict["model_state_dict"])
         if load_optimizer and resumed_training:
             self.alg.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
 
         if resumed_training and "iter" in loaded_dict:
             self.current_learning_iteration = loaded_dict["iter"]
+
+        # Load adversary from separate file if it exists
+        adversary_path = path.replace(".pt", "_adversary.pt")
+        if os.path.exists(adversary_path):
+            adversary_loaded_dict = torch.load(adversary_path, weights_only=False, map_location=map_location)
+            adversary_resumed_training = self.alg_adversary.policy.load_state_dict(adversary_loaded_dict["model_state_dict"])
+            if load_optimizer and adversary_resumed_training:
+                self.alg_adversary.optimizer.load_state_dict(adversary_loaded_dict["optimizer_state_dict"])
+
         return loaded_dict.get("infos")
 
     def get_inference_policy(self, device: str | None = None) -> callable:
@@ -722,22 +595,6 @@ class MultiAgentRunner:
         )
         return alg
 
-    def _resolve_randomized_param_names(self) -> list[str]:
-        cfg_names = self.cfg.get("randomized_param_names", None)
-        if isinstance(cfg_names, (list, tuple)) and len(cfg_names) == 18:
-            return [str(x) for x in cfg_names]
-        return [
-            "robot_static_friction", "robot_dynamic_friction",
-            "insertive_object_static_friction", "insertive_object_dynamic_friction",
-            "receptive_object_static_friction", "receptive_object_dynamic_friction",
-            "table_static_friction", "table_dynamic_friction",
-            "robot_mass_scale", "insertive_object_mass_scale",
-            "receptive_object_mass_scale", "table_mass_scale",
-            "robot_joint_friction_scale", "robot_joint_armature_scale",
-            "gripper_stiffness_scale", "gripper_damping_scale",
-            "osc_stiffness_scale", "osc_damping_scale",
-        ]
-
     def _prepare_logging_writer(self) -> None:
         """Prepare the logging writers."""
         if self.log_dir is not None and self.writer is None and not self.disable_logs:
@@ -771,87 +628,3 @@ class MultiAgentRunner:
                 self.writer = SummaryWriter(log_dir=self.log_dir, flush_secs=10)
             else:
                 raise ValueError("Logger type not found. Please choose 'neptune', 'wandb' or 'tensorboard'.")
-
-    def _extract_randomized_params(self) -> torch.Tensor:
-        # In distributed training, each rank should only extract from its assigned environments
-        # If env.num_envs returns total, we need to determine per-rank subset
-        total_envs = self.env.num_envs
-        if self.is_distributed:
-            # Calculate which environments belong to this rank
-            # Typically: rank R handles environments [R * (N/W) : (R+1) * (N/W)]
-            envs_per_rank = total_envs // self.gpu_world_size
-            start_env = self.gpu_global_rank * envs_per_rank
-            end_env = start_env + envs_per_rank if self.gpu_global_rank < self.gpu_world_size - 1 else total_envs
-            num_envs = end_env - start_env
-            env_indices = slice(start_env, end_env)
-        else:
-            num_envs = total_envs
-            env_indices = slice(None)
-        
-        params = torch.zeros((num_envs, 18), dtype=torch.float, device=self.device)
-        scene = self.env.unwrapped.scene
-
-        robot = scene["robot"]
-        materials = robot.root_physx_view.get_material_properties()[env_indices]
-        params[:, 0] = materials[:, :, 0].to(self.device).mean(dim=1)
-        params[:, 1] = materials[:, :, 1].to(self.device).mean(dim=1)
-        current_masses = robot.root_physx_view.get_masses()[env_indices].to(self.device)
-        default_masses = robot.data.default_mass[env_indices].to(self.device)
-        params[:, 8] = (current_masses / (default_masses + 1e-8)).mean(dim=1)
-        current_friction = robot.data.joint_friction_coeff[env_indices].to(self.device)
-        default_friction = robot.data.default_joint_friction_coeff[env_indices].to(self.device)
-        params[:, 12] = (current_friction / (default_friction + 1e-8)).mean(dim=1)
-        current_armature = robot.data.joint_armature[env_indices].to(self.device)
-        default_armature = robot.data.default_joint_armature[env_indices].to(self.device)
-        params[:, 13] = (current_armature / (default_armature + 1e-8)).mean(dim=1)
-        current_stiffness = robot.data.joint_stiffness[env_indices].to(self.device)
-        default_stiffness = robot.data.default_joint_stiffness[env_indices].to(self.device)
-        params[:, 14] = (current_stiffness / (default_stiffness + 1e-8)).mean(dim=1)
-        current_damping = robot.data.joint_damping[env_indices].to(self.device)
-        default_damping = robot.data.default_joint_damping[env_indices].to(self.device)
-        params[:, 15] = (current_damping / (default_damping + 1e-8)).mean(dim=1)
-
-        insertive_obj = scene["insertive_object"]
-        materials = insertive_obj.root_physx_view.get_material_properties()[env_indices]
-        params[:, 2] = materials[:, :, 0].to(self.device).mean(dim=1)
-        params[:, 3] = materials[:, :, 1].to(self.device).mean(dim=1)
-        current_masses = insertive_obj.root_physx_view.get_masses()[env_indices].to(self.device)
-        default_masses = insertive_obj.data.default_mass[env_indices].to(self.device)
-        params[:, 9] = (current_masses / (default_masses + 1e-8)).mean(dim=1)
-
-        receptive_obj = scene["receptive_object"]
-        materials = receptive_obj.root_physx_view.get_material_properties()[env_indices]
-        params[:, 4] = materials[:, :, 0].to(self.device).mean(dim=1)
-        params[:, 5] = materials[:, :, 1].to(self.device).mean(dim=1)
-        current_masses = receptive_obj.root_physx_view.get_masses()[env_indices].to(self.device)
-        default_masses = receptive_obj.data.default_mass[env_indices].to(self.device)
-        params[:, 10] = (current_masses / (default_masses + 1e-8)).mean(dim=1)
-
-        table = scene["table"]
-        materials = table.root_physx_view.get_material_properties()[env_indices]
-        params[:, 6] = materials[:, :, 0].to(self.device).mean(dim=1)
-        params[:, 7] = materials[:, :, 1].to(self.device).mean(dim=1)
-        current_masses = table.root_physx_view.get_masses()[env_indices].to(self.device)
-        default_masses = table.data.default_mass[env_indices].to(self.device)
-        params[:, 11] = (current_masses / (default_masses + 1e-8)).mean(dim=1)
-
-        osc_action_term = self.env.unwrapped.action_manager._terms.get("arm")
-        controller = osc_action_term._osc
-        # Get current stiffness gains (diagonal of motion_p_gains_task)
-        current_stiffness_diag = torch.diagonal(controller._motion_p_gains_task[env_indices], dim1=-2, dim2=-1)
-        # Default stiffness from config (6 values: xyz, rpy)
-        default_stiffness = torch.tensor(controller.cfg.motion_stiffness_task, device=self.device)
-        # Extract scale from xyz block (use first element or mean)
-        current_stiffness_xyz = current_stiffness_diag[:, 0]  # First xyz element
-        default_stiffness_xyz = default_stiffness[0]
-        params[:, 16] = current_stiffness_xyz / (default_stiffness_xyz + 1e-8)
-
-        # Get current damping gains and compute damping ratio
-        current_damping_diag = torch.diagonal(controller._motion_d_gains_task[env_indices], dim1=-2, dim2=-1)
-        # Damping = 2 * sqrt(stiffness) * damping_ratio, so damping_ratio = damping / (2 * sqrt(stiffness))
-        current_damping_ratio_xyz = current_damping_diag[:, 0] / (2 * current_stiffness_xyz.sqrt() + 1e-8)
-        default_damping_ratio = torch.tensor(controller.cfg.motion_damping_ratio_task, device=self.device)
-        default_damping_ratio_xyz = default_damping_ratio[0]
-        params[:, 17] = current_damping_ratio_xyz / (default_damping_ratio_xyz + 1e-8)
-
-        return params
