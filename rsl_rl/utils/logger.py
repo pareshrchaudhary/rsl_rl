@@ -262,7 +262,7 @@ def log_multi_agent(
         writer.add_scalar("Train/mean_reward", statistics.mean(locs["rewbuffer"]), locs["it"])
         writer.add_scalar("Train/mean_episode_length", statistics.mean(locs["lenbuffer"]), locs["it"])
         if "adv_rewbuffer" in locs and len(locs["adv_rewbuffer"]) > 0:
-            writer.add_scalar("Adversary/mean_reward", statistics.mean(locs["adv_rewbuffer"]), locs["it"])
+            writer.add_scalar("Adversary/mean_regret", statistics.mean(locs["adv_rewbuffer"]), locs["it"])
         if logger_type != "wandb":  # wandb does not support non-integer x-axis logging
             writer.add_scalar("Train/mean_reward/time", statistics.mean(locs["rewbuffer"]), tot_time)
             writer.add_scalar(
@@ -287,7 +287,7 @@ def log_multi_agent(
                 log_string += f"""{f"Mean adversary {key} loss:":>{pad}} {value:.4f}\n"""
         log_string += f"""{"Mean reward:":>{pad}} {statistics.mean(locs["rewbuffer"]):.2f}\n"""
         if "adv_rewbuffer" in locs and len(locs["adv_rewbuffer"]) > 0:
-            log_string += f"""{f"Mean adversary reward:":>{pad}} {statistics.mean(locs["adv_rewbuffer"]):.2f}\n"""
+            log_string += f"""{f"Mean adversary regret:":>{pad}} {statistics.mean(locs["adv_rewbuffer"]):.2f}\n"""
         # Print regret metrics
         log_string += f"""{"Max batch reward:":>{pad}} {locs["max_batch_total_reward"]:.2f}\n"""
         log_string += f"""{"Regret:":>{pad}} {locs["regret"]:.2f}\n"""

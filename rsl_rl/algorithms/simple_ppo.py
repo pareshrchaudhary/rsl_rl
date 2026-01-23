@@ -135,6 +135,7 @@ class SimplePPO:
 
         mean_surrogate_loss = 0.0
         mean_entropy = 0.0
+        mean_kl = 0.0
         num_updates = 0
         for (
             obs_batch,
@@ -160,34 +161,6 @@ class SimplePPO:
             self.policy.act(obs_batch)
             actions_log_prob_batch = self.policy.get_actions_log_prob(actions_batch)
             entropy_batch = self.policy.entropy
-            mu_batch = self.policy.action_mean
-            sigma_batch = self.policy.action_std
-
-            # Optional KL-adaptive LR (copied from PPO)
-            if self.desired_kl is not None and self.schedule == "adaptive":
-                with torch.inference_mode():
-                    kl = torch.sum(
-                        torch.log(sigma_batch / old_sigma_batch + 1.0e-5)
-                        + (torch.square(old_sigma_batch) + torch.square(old_mu_batch - mu_batch))
-                        / (2.0 * torch.square(sigma_batch))
-                        - 0.5,
-                        dim=-1,
-                    )
-                    kl_mean = torch.mean(kl)
-                    if self.is_multi_gpu:
-                        torch.distributed.all_reduce(kl_mean, op=torch.distributed.ReduceOp.SUM)
-                        kl_mean /= self.gpu_world_size
-                    if self.gpu_global_rank == 0:
-                        if kl_mean > self.desired_kl * 2.0:
-                            self.learning_rate = max(1e-5, self.learning_rate / 1.5)
-                        elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
-                            self.learning_rate = min(1e-2, self.learning_rate * 1.5)
-                    if self.is_multi_gpu:
-                        lr_tensor = torch.tensor(self.learning_rate, device=self.device)
-                        torch.distributed.broadcast(lr_tensor, src=0)
-                        self.learning_rate = float(lr_tensor.item())
-                    for param_group in self.optimizer.param_groups:
-                        param_group["lr"] = self.learning_rate
 
             ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
             surrogate = -torch.squeeze(advantages_batch) * ratio
@@ -204,20 +177,61 @@ class SimplePPO:
             torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
             self.optimizer.step()
 
+            # KL divergence: compute *post-update* KL(old || new) for logging/adaptive LR.
+            # This makes KL meaningful even when num_updates == 1 (common for bandit adversary).
+            kl_mean = None
+            if self.desired_kl is not None:
+                with torch.inference_mode():
+                    self.policy.act(obs_batch)
+                    new_mu_batch = self.policy.action_mean
+                    new_sigma_batch = self.policy.action_std
+                    kl = torch.sum(
+                        torch.log(new_sigma_batch / old_sigma_batch + 1.0e-5)
+                        + (torch.square(old_sigma_batch) + torch.square(old_mu_batch - new_mu_batch))
+                        / (2.0 * torch.square(new_sigma_batch))
+                        - 0.5,
+                        dim=-1,
+                    )
+                    kl_mean = torch.mean(kl)
+                    if self.is_multi_gpu:
+                        torch.distributed.all_reduce(kl_mean, op=torch.distributed.ReduceOp.SUM)
+                        kl_mean /= self.gpu_world_size
+
+                # Optional KL-adaptive LR (applies to future updates)
+                if self.schedule == "adaptive":
+                    if self.gpu_global_rank == 0:
+                        if kl_mean > self.desired_kl * 2.0:
+                            self.learning_rate = max(1e-5, self.learning_rate / 1.5)
+                        elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
+                            self.learning_rate = min(1e-2, self.learning_rate * 1.5)
+                    if self.is_multi_gpu:
+                        lr_tensor = torch.tensor(self.learning_rate, device=self.device)
+                        torch.distributed.broadcast(lr_tensor, src=0)
+                        self.learning_rate = float(lr_tensor.item())
+                    for param_group in self.optimizer.param_groups:
+                        param_group["lr"] = self.learning_rate
+
             mean_surrogate_loss += float(surrogate_loss.item())
             mean_entropy += float(entropy_term.item())
+            if kl_mean is not None:
+                mean_kl += float(kl_mean.item())
             num_updates += 1
 
         if num_updates > 0:
             mean_surrogate_loss /= num_updates
             mean_entropy /= num_updates
+            if self.desired_kl is not None:
+                mean_kl /= num_updates
 
         self.storage.clear()
-        return {
+        loss_dict = {
             "surrogate": mean_surrogate_loss,
             "entropy": mean_entropy,
             "learning_rate": float(self.optimizer.param_groups[0]["lr"]),
         }
+        if self.desired_kl is not None:
+            loss_dict["kl"] = mean_kl
+        return loss_dict
 
     def broadcast_parameters(self) -> None:
         """Broadcast model parameters to all GPUs (for distributed training)."""

@@ -119,6 +119,8 @@ class MultiAgentRunner:
         cur_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
         cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
         adv_rewbuffer = deque(maxlen=100)
+        # Track episode rewards PER ENV for proper credit assignment (across K policy iterations)
+        per_env_episode_rewards: list[list[float]] = [[] for _ in range(self.env.num_envs)]
 
         # Ensure all parameters are in-synced
         if self.is_distributed:
@@ -137,22 +139,27 @@ class MultiAgentRunner:
                 with h5py.File(param_h5_path, "w") as f:
                     f.attrs["param_names"] = [n.encode("utf-8") for n in self.randomized_param_names]
         
-        raw_params_list = []  # Store raw parameters before aggregation
+        raw_params_list = []
+        policy_iteration_count = 0  # Count policy updates since last adversary update
+        # Track last adversary loss dict to log when no update happens
+        last_adv_loss_dict_mean: dict[str, float] | None = None
+
+        # Keep adversary actions constant for K policy iterations.
+        # We sample them at the start of each K-block (when policy_iteration_count == 0).
+        adversary_actions: torch.Tensor | None = None
+
+        
         for it in range(start_iter, tot_iter):
             start = time.time()
-            # Reset adversary update window per rollout so we update exactly every k steps within num_steps_per_env.
-            adv_step = 0
-            adv_reward_window: list[float] = []
+            if policy_iteration_count == 0:
+                with torch.inference_mode():
+                    adversary_actions = self.alg_adversary.act(obs)
             # Rollout-batch *episode* reward stats (per-iteration, episode-based):
             # We compute these over episodes that TERMINATE during this rollout collection window.
             # In distributed mode, these are aggregated across ranks to match the full batch.
             batch_episode_reward_sum = torch.tensor(0.0, dtype=torch.float, device=self.device)
             batch_episode_count = torch.tensor(0.0, dtype=torch.float, device=self.device)
             batch_episode_reward_max = torch.tensor(float("-inf"), dtype=torch.float, device=self.device)
-
-            # Track adversary updates within this learning iteration.
-            adv_updates = 0
-            adv_loss_sum: dict[str, float] = {}
 
             # Extract parameters once per iteration
             randomized_params = extract_randomized_params(
@@ -165,54 +172,46 @@ class MultiAgentRunner:
             for _ in range(self.num_steps_per_env):
                 # Agent stepping is inference-only; updates happen outside.
                 with torch.inference_mode():
-                    # Sample actions from both agents (each uses its own obs_groups mapping).
-                    _, adversary_actions, actions = self._act_both(obs)
+                    # Note: Adversary actions (env params) are applied on reset by environment backend.
+                    policy_actions = self.alg.act(obs)
+                    actions = torch.cat([policy_actions, adversary_actions], dim=-1)
 
-                    # Step the environment with combined actions.
                     obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
                     obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
 
-                    # Adversary reward: regret over the last k policy step-mean rewards.
-                    # regret = max(window) - mean(window), computed when window reaches k steps.
-                    adv_rewards, adv_step, adv_reward_window, do_adv_update, adv_regret = self._compute_adversary_rewards(
-                        rewards, adv_step, adv_reward_window
-                    )
-
-                    # Process env step for both agents.
+                    # Process env step for policy (adversary frozen during policy training).
                     self.alg.process_env_step(obs, rewards, dones, extras)
-                    # Bandit-style adversary: only store the transition on the update step.
-                    if do_adv_update:
-                        self.alg_adversary.process_env_step(obs, adv_rewards, dones, extras)
 
-                    # Book keeping (like OnPolicyRunner)
+                    # Collect episode-level info for logging (if available).
                     if self.log_dir is not None:
-                        done_ids = (dones > 0).nonzero(as_tuple=False)
-                        batch_episode_reward_sum, batch_episode_count, batch_episode_reward_max = (
-                            self._update_rollout_bookkeeping(
-                                extras,
-                                ep_infos,
-                                rewards,
-                                done_ids,
-                                cur_reward_sum,
-                                cur_episode_length,
-                                rewbuffer,
-                                lenbuffer,
-                                batch_episode_reward_sum,
-                                batch_episode_count,
-                                batch_episode_reward_max,
-                            )
-                        )
+                        if "episode" in extras:
+                            ep_infos.append(extras["episode"])
+                        elif "log" in extras:
+                            ep_infos.append(extras["log"])
 
-                    if do_adv_update:
-                        # Store the regret value for logging (one value per adversary update).
-                        adv_rewbuffer.append(adv_regret)
-                        self.alg_adversary.compute_returns(obs)
+                    # Note: rewards/dones are vectorized over envs; done_ids indexes envs that reset this step.
+                    done_ids = (dones > 0).nonzero(as_tuple=False)
+                    cur_reward_sum += rewards
+                    cur_episode_length += 1
+                    if done_ids.numel() > 0:
+                        ep_returns = cur_reward_sum[done_ids][:, 0]
+                        # Track per-env for adversary credit assignment
+                        done_env_indices = done_ids[:, 0].cpu().numpy().tolist()
+                        ep_returns_list = ep_returns.cpu().numpy().tolist()
+                        for env_idx, ret in zip(done_env_indices, ep_returns_list):
+                            per_env_episode_rewards[env_idx].append(ret)
 
-                if do_adv_update:
-                    adv_loss_dict = self.alg_adversary.update()
-                    for k, v in adv_loss_dict.items():
-                        adv_loss_sum[k] = adv_loss_sum.get(k, 0.0) + float(v)
-                    adv_updates += 1
+                        # If logging is enabled, also update rollout episode stats/buffers.
+                        if self.log_dir is not None:
+                            batch_episode_reward_sum += ep_returns.sum()
+                            batch_episode_count += float(ep_returns.numel())
+                            batch_episode_reward_max = torch.maximum(batch_episode_reward_max, ep_returns.max())
+                            rewbuffer.extend(ep_returns.cpu().numpy().tolist())
+                            lenbuffer.extend(cur_episode_length[done_ids][:, 0].cpu().numpy().tolist())
+
+                        # Reset episode accumulators for envs that terminated.
+                        cur_reward_sum[done_ids] = 0
+                        cur_episode_length[done_ids] = 0
 
             # Compute rollout-batch EPISODE regret metrics for this iteration.
             # Note: In distributed mode, we aggregate across ranks.
@@ -232,7 +231,7 @@ class MultiAgentRunner:
                 max_batch_total_reward = 0.0
                 mean_batch_total_reward = 0.0
                 regret = 0.0
-            # Replace tensor with float for logging compatibility (same as OnPolicyRunner).
+            # Replace tensor with float for logging compatibility
             batch_episode_count = batch_episode_count_f
 
             stop = time.time()
@@ -278,9 +277,60 @@ class MultiAgentRunner:
 
             # Update policy
             loss_dict = self.alg.update()
+            policy_iteration_count += 1
+            
+            # Adversary update: every K policy iterations
             adv_loss_dict_mean = None
-            if adv_updates > 0:
-                adv_loss_dict_mean = {k: v / adv_updates for k, v in adv_loss_sum.items()}
+            if policy_iteration_count >= self.adversary_update_every_k_steps:
+                # Compute per-env regret for proper credit assignment
+                # Global max across ALL episodes from ALL envs
+                all_rewards = [r for env_rewards in per_env_episode_rewards for r in env_rewards]
+                
+                if len(all_rewards) > 0:
+                    global_max = max(all_rewards)
+                    
+                    # Sync global_max across all ranks in distributed mode
+                    if self.is_distributed:
+                        global_max_tensor = torch.tensor(global_max, dtype=torch.float, device=self.device)
+                        torch.distributed.all_reduce(global_max_tensor, op=torch.distributed.ReduceOp.MAX)
+                        global_max = float(global_max_tensor.item())
+                    
+                    # Per-env mean (use global mean as fallback if env had no episodes)
+                    global_mean = sum(all_rewards) / len(all_rewards)
+                    per_env_regret = []
+                    for env_idx in range(self.env.num_envs):
+                        if len(per_env_episode_rewards[env_idx]) > 0:
+                            env_mean = sum(per_env_episode_rewards[env_idx]) / len(per_env_episode_rewards[env_idx])
+                        else:
+                            env_mean = global_mean  # Fallback if no episodes completed for this env
+                        per_env_regret.append(global_max - env_mean)
+                    
+                    adv_rewards = torch.tensor(per_env_regret, dtype=torch.float, device=self.device).unsqueeze(-1)
+                    adv_mean_regret = sum(per_env_regret) / len(per_env_regret)  # For logging
+                else:
+                    adv_rewards = torch.zeros((self.env.num_envs, 1), dtype=torch.float, device=self.device)
+                    adv_mean_regret = 0.0
+                
+                # Store adversary transition (bandit-style)
+                dummy_obs = obs
+                dummy_dones = torch.ones((self.env.num_envs, 1), dtype=torch.float, device=self.device)
+                
+                self.alg_adversary.process_env_step(dummy_obs, adv_rewards, dummy_dones, {})
+                self.alg_adversary.compute_returns(dummy_obs)
+                adv_loss_dict = self.alg_adversary.update()
+                
+                # Log adversary metrics
+                adv_loss_dict_mean = adv_loss_dict
+                last_adv_loss_dict_mean = adv_loss_dict_mean
+                adv_rewbuffer.append(adv_mean_regret)
+                
+                # Reset counters for next K policy iterations
+                policy_iteration_count = 0
+                per_env_episode_rewards = [[] for _ in range(self.env.num_envs)]
+                adversary_actions = None
+            else:
+                # No adversary update this iteration; reuse last logged value
+                adv_loss_dict_mean = last_adv_loss_dict_mean
 
             stop = time.time()
             learn_time = stop - start
@@ -359,83 +409,6 @@ class MultiAgentRunner:
                     group = f.create_group(f"iteration_{self.current_learning_iteration}")
                     group.create_dataset("raw_params", data=all_params.numpy())
                     group.attrs["num_samples"] = all_params.shape[0]
-
-    def _act_both(self, obs: TensorDict) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Sample policy + adversary actions and concatenate for env.step()."""
-        policy_actions = self.alg.act(obs)
-        adversary_actions = self.alg_adversary.act(obs)
-        actions = torch.cat([policy_actions, adversary_actions], dim=-1)
-        return policy_actions, adversary_actions, actions
-
-    def _compute_adversary_rewards(
-        self,
-        rewards: torch.Tensor,
-        adv_step: int,
-        adv_reward_window: list[float],
-    ) -> tuple[torch.Tensor, int, list[float], bool, float]:
-        """Adversary reward (bandit) emitted every k steps.
-
-        For each env.step(), we compute:
-            batch_max_t  = max(rewards over envs)
-            batch_mean_t = mean(rewards over envs)
-
-        When the window length reaches k (= adversary_update_every_k_steps), we compute:
-            regret = max(batch_max_{t-k+1:t}) - batch_mean_t
-
-        On the update step, we provide the logged scalar regret as a dense per-env bandit return:
-            R_i = regret = window_max - mean(rewards)
-        """
-        batch_max = float(rewards.max().item())
-        batch_mean = float(rewards.mean().item())
-        adv_reward_window.append(batch_max)
-        adv_step += 1
-
-        if adv_step < self.adversary_update_every_k_steps:
-            return torch.zeros_like(rewards), adv_step, adv_reward_window, False, 0.0
-
-        # Compute regret over the window and emit as reward.
-        window_max = max(adv_reward_window)
-        regret = float(window_max - batch_mean)
-        adv_rewards = torch.full_like(rewards, regret)
-        # Reset window/counter for next adversary interval.
-        return adv_rewards, 0, [], True, regret
-
-    def _update_rollout_bookkeeping(
-        self,
-        extras: dict,
-        ep_infos: list,
-        rewards: torch.Tensor,
-        done_ids: torch.Tensor,
-        cur_reward_sum: torch.Tensor,
-        cur_episode_length: torch.Tensor,
-        rewbuffer: deque,
-        lenbuffer: deque,
-        batch_episode_reward_sum: torch.Tensor,
-        batch_episode_count: torch.Tensor,
-        batch_episode_reward_max: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Update episode reward/length buffers and per-iteration episode metrics."""
-        if "episode" in extras:
-            ep_infos.append(extras["episode"])
-        elif "log" in extras:
-            ep_infos.append(extras["log"])
-
-        cur_reward_sum += rewards
-        cur_episode_length += 1
-
-        if done_ids.numel() == 0:
-            return batch_episode_reward_sum, batch_episode_count, batch_episode_reward_max
-
-        ep_returns = cur_reward_sum[done_ids][:, 0]
-        batch_episode_reward_sum += ep_returns.sum()
-        batch_episode_count += float(ep_returns.numel())
-        batch_episode_reward_max = torch.maximum(batch_episode_reward_max, ep_returns.max())
-
-        rewbuffer.extend(cur_reward_sum[done_ids][:, 0].cpu().numpy().tolist())
-        lenbuffer.extend(cur_episode_length[done_ids][:, 0].cpu().numpy().tolist())
-        cur_reward_sum[done_ids] = 0
-        cur_episode_length[done_ids] = 0
-        return batch_episode_reward_sum, batch_episode_count, batch_episode_reward_max
 
     def save(self, path: str, infos: dict | None = None) -> None:
         saved_dict = {
