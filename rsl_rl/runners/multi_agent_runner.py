@@ -18,7 +18,7 @@ import rsl_rl
 from rsl_rl.algorithms import PPO
 from rsl_rl.algorithms.simple_ppo import SimplePPO
 from rsl_rl.env import VecEnv
-from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, resolve_symmetry_config
+from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, AsymmetricActorCritic, resolve_symmetry_config
 from rsl_rl.utils import resolve_obs_groups, store_code_state
 from rsl_rl.utils.logger import resolve_randomized_param_names, extract_randomized_params, log_multi_agent
 
@@ -571,6 +571,9 @@ class MultiAgentRunner:
     def _prepare_logging_writer(self) -> None:
         """Prepare the logging writers."""
         if self.log_dir is not None and self.writer is None and not self.disable_logs:
+            # Ensure log directory exists
+            os.makedirs(self.log_dir, exist_ok=True)
+            
             # Launch either Tensorboard or Neptune or Tensorboard summary writer, default: Tensorboard.
             self.logger_type = self.cfg.get("logger", "tensorboard")
             self.logger_type = self.logger_type.lower()
