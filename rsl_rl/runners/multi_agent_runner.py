@@ -546,10 +546,10 @@ class MultiAgentRunner:
             if policy_cfg.get("critic_obs_normalization") is None:
                 policy_cfg["critic_obs_normalization"] = self.cfg["empirical_normalization"]
 
-        # Initialize the policy
+        # Initialize the policy (supports ActorCritic, ActorCriticRecurrent, AsymmetricActorCritic)
         actor_critic_class = eval(policy_cfg["class_name"])
         policy_kwargs = {k: v for k, v in policy_cfg.items() if k != "class_name"}
-        actor_critic: ActorCritic | ActorCriticRecurrent = actor_critic_class(
+        actor_critic: ActorCritic | ActorCriticRecurrent | AsymmetricActorCritic = actor_critic_class(
             obs, obs_groups, action_dim, **policy_kwargs
         ).to(self.device)
 
