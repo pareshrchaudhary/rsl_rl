@@ -238,8 +238,9 @@ class ActorCriticRecurrent(nn.Module):
             elif self.noise_std_type == "log":
                 self.log_std = nn.Parameter(torch.log(init_noise_std * torch.ones(num_actions)))
             elif self.noise_std_type == "gsde":
+                latent_dim = actor_hidden_dims[-1] if actor_hidden_dims else rnn_hidden_dim
                 self.log_std = nn.Parameter(
-                    torch.ones(rnn_hidden_dim, num_actions) * torch.log(torch.tensor(init_noise_std))
+                    torch.ones(latent_dim, num_actions) * torch.log(torch.tensor(init_noise_std))
                 )
             else:
                 raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
