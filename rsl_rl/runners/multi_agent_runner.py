@@ -48,8 +48,8 @@ class MultiAgentRunner:
         self.record_parameters = self.cfg.get("record_parameters", False)
 
         # Action split: policy controls robot, adversary controls last `adversary_action_dim` entries.
-        # NOTE: For UWLab adversarial tasks this is 9 (see AdversaryActionCfg.action_dim).
-        self.adversary_action_dim = int(self.cfg.get("adversary_action_dim", 9))
+        # NOTE: For UWLab adversarial tasks this is 19 (see AdversaryActionCfg.action_dim).
+        self.adversary_action_dim = int(self.cfg.get("adversary_action_dim", 19))
         if self.env.num_actions <= self.adversary_action_dim:
             raise ValueError(
                 f"env.num_actions ({self.env.num_actions}) must be > adversary_action_dim ({self.adversary_action_dim})."
@@ -242,7 +242,7 @@ class MultiAgentRunner:
             all_params_cpu = None  # Store for HDF5 saving
             if raw_params_list:
                 # Extract the single parameter tensor (one per environment per iteration)
-                raw_params_tensor = raw_params_list[0]  # (num_envs, 18) on GPU
+                raw_params_tensor = raw_params_list[0]  # (num_envs, 19) on GPU
                 
                 if self.is_distributed:
                     # Gather from all ranks
@@ -265,10 +265,10 @@ class MultiAgentRunner:
                     param_min_v = all_params.min(dim=0).values.cpu().tolist()
                     param_max_v = all_params.max(dim=0).values.cpu().tolist()
                 else:
-                    zeros = [0.0] * 18
+                    zeros = [0.0] * 19
                     param_mean = param_std = param_min_v = param_max_v = zeros
             else:
-                zeros = [0.0] * 18
+                zeros = [0.0] * 19
                 param_mean = param_std = param_min_v = param_max_v = zeros
 
             # Compute returns
@@ -389,7 +389,7 @@ class MultiAgentRunner:
         
         # Gather and save any remaining raw parameters (all ranks participate in gather)
         if self.record_parameters and raw_params_list and param_h5_path:
-            raw_params_tensor = raw_params_list[0]  # Single tensor (num_envs, 18) on GPU
+            raw_params_tensor = raw_params_list[0]  # Single tensor (num_envs, 19) on GPU
             raw_params_list.clear()
             
             if self.is_distributed:
