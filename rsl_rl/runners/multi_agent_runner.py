@@ -279,47 +279,37 @@ class MultiAgentRunner:
             loss_dict = self.alg.update()
             policy_iteration_count += 1
 
-            # Total completed episodes since last adversary update (this rank)
-            episodes_since_adv_update = sum(
-                len(per_env_episode_rewards[i]) for i in range(self.env.num_envs)
+            # Min completed episodes over envs (this rank): update when every env has at least K
+            min_episodes_per_env = (
+                min(len(per_env_episode_rewards[i]) for i in range(self.env.num_envs))
+                if self.env.num_envs > 0
+                else 0
             )
             if self.is_distributed:
-                count_tensor = torch.tensor(
-                    float(episodes_since_adv_update),
+                min_tensor = torch.tensor(
+                    float(min_episodes_per_env),
                     dtype=torch.float,
                     device=self.device,
                 )
-                torch.distributed.all_reduce(count_tensor, op=torch.distributed.ReduceOp.SUM)
-                episodes_since_adv_update = int(count_tensor.item())
+                torch.distributed.all_reduce(min_tensor, op=torch.distributed.ReduceOp.MIN)
+                min_episodes_per_env = int(min_tensor.item())
 
             # Adversary update: every K completed episodes (across all envs / ranks)
             adv_loss_dict_mean = None
-            if episodes_since_adv_update >= self.adversary_update_every_k_episodes:
-                # Compute per-env regret for proper credit assignment
-                # Global max across ALL episodes from ALL envs
-                all_rewards = [r for env_rewards in per_env_episode_rewards for r in env_rewards]
-                
-                if len(all_rewards) > 0:
-                    global_max = max(all_rewards)
-                    
-                    # Sync global_max across all ranks in distributed mode
-                    if self.is_distributed:
-                        global_max_tensor = torch.tensor(global_max, dtype=torch.float, device=self.device)
-                        torch.distributed.all_reduce(global_max_tensor, op=torch.distributed.ReduceOp.MAX)
-                        global_max = float(global_max_tensor.item())
-                    
-                    # Per-env mean (use global mean as fallback if env had no episodes)
-                    global_mean = sum(all_rewards) / len(all_rewards)
-                    per_env_regret = []
-                    for env_idx in range(self.env.num_envs):
-                        if len(per_env_episode_rewards[env_idx]) > 0:
-                            env_mean = sum(per_env_episode_rewards[env_idx]) / len(per_env_episode_rewards[env_idx])
-                        else:
-                            env_mean = global_mean  # Fallback if no episodes completed for this env
-                        per_env_regret.append(global_max - env_mean)
-                    
+            if min_episodes_per_env >= self.adversary_update_every_k_episodes:
+                # Per-env regret: regret_i = max_j R_{i,j} - (1/K) sum_j R_{i,j}
+                per_env_regret = []
+                for env_idx in range(self.env.num_envs):
+                    rewards_i = per_env_episode_rewards[env_idx]
+                    if len(rewards_i) > 0:
+                        env_max = max(rewards_i)
+                        env_mean = sum(rewards_i) / len(rewards_i)
+                        per_env_regret.append(env_max - env_mean)
+                    else:
+                        per_env_regret.append(0.0)
+                if len(per_env_regret) > 0:
                     adv_rewards = torch.tensor(per_env_regret, dtype=torch.float, device=self.device).unsqueeze(-1)
-                    adv_mean_regret = sum(per_env_regret) / len(per_env_regret)  # For logging
+                    adv_mean_regret = sum(per_env_regret) / len(per_env_regret)
                 else:
                     adv_rewards = torch.zeros((self.env.num_envs, 1), dtype=torch.float, device=self.device)
                     adv_mean_regret = 0.0
