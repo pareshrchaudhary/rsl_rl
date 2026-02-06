@@ -43,7 +43,7 @@ class MultiAgentRunner:
 
         # Store training configuration
         self.num_steps_per_env = self.cfg["num_steps_per_env"]
-        self.adversary_update_every_k_steps = self.cfg["adversary_update_every_k_steps"]
+        self.adversary_update_every_k_episodes = self.cfg["adversary_update_every_k_episodes"]
         self.save_interval = self.cfg["save_interval"]
         self.record_parameters = self.cfg.get("record_parameters", False)
 
@@ -278,10 +278,23 @@ class MultiAgentRunner:
             # Update policy
             loss_dict = self.alg.update()
             policy_iteration_count += 1
-            
-            # Adversary update: every K policy iterations
+
+            # Total completed episodes since last adversary update (this rank)
+            episodes_since_adv_update = sum(
+                len(per_env_episode_rewards[i]) for i in range(self.env.num_envs)
+            )
+            if self.is_distributed:
+                count_tensor = torch.tensor(
+                    float(episodes_since_adv_update),
+                    dtype=torch.float,
+                    device=self.device,
+                )
+                torch.distributed.all_reduce(count_tensor, op=torch.distributed.ReduceOp.SUM)
+                episodes_since_adv_update = int(count_tensor.item())
+
+            # Adversary update: every K completed episodes (across all envs / ranks)
             adv_loss_dict_mean = None
-            if policy_iteration_count >= self.adversary_update_every_k_steps:
+            if episodes_since_adv_update >= self.adversary_update_every_k_episodes:
                 # Compute per-env regret for proper credit assignment
                 # Global max across ALL episodes from ALL envs
                 all_rewards = [r for env_rewards in per_env_episode_rewards for r in env_rewards]
@@ -324,7 +337,7 @@ class MultiAgentRunner:
                 last_adv_loss_dict_mean = adv_loss_dict_mean
                 adv_rewbuffer.append(adv_mean_regret)
                 
-                # Reset counters for next K policy iterations
+                # Reset for next adversary block
                 policy_iteration_count = 0
                 per_env_episode_rewards = [[] for _ in range(self.env.num_envs)]
                 adversary_actions = None
