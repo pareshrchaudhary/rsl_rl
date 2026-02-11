@@ -14,6 +14,8 @@ import h5py
 from collections import deque
 from tensordict import TensorDict
 
+import torch.nn as nn
+
 import rsl_rl
 from rsl_rl.algorithms import PPO
 from rsl_rl.algorithms.simple_ppo import SimplePPO
@@ -21,6 +23,21 @@ from rsl_rl.env import VecEnv
 from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, AsymmetricActorCritic, resolve_symmetry_config
 from rsl_rl.utils import resolve_obs_groups, store_code_state
 from rsl_rl.utils.logger import resolve_randomized_param_names, extract_randomized_params, log_multi_agent
+
+
+def _init_adversary_reset_prob_logits(policy, initial_probs: list[float], start_idx: int, device: torch.device) -> None:
+    """Set adversary actor's last-layer bias for prob indices so softmax(output) ~ initial_probs."""
+    actor = policy.actor
+    linears = [m for m in actor.modules() if isinstance(m, nn.Linear)]
+    if not linears:
+        return
+    last_linear = linears[-1]
+    probs = torch.tensor(initial_probs, device=device, dtype=last_linear.bias.dtype)
+    logits = torch.log(probs.clamp(min=1e-6))
+    end_idx = start_idx + len(initial_probs)
+    if end_idx <= last_linear.bias.shape[0]:
+        with torch.no_grad():
+            last_linear.bias[start_idx:end_idx] = logits
 
 
 class MultiAgentRunner:
@@ -48,8 +65,7 @@ class MultiAgentRunner:
         self.record_parameters = self.cfg.get("record_parameters", False)
 
         # Action split: policy controls robot, adversary controls last `adversary_action_dim` entries.
-        # NOTE: For UWLab adversarial tasks this is 19 (see AdversaryActionCfg.action_dim).
-        self.adversary_action_dim = int(self.cfg.get("adversary_action_dim", 19))
+        self.adversary_action_dim = int(self.cfg.get("adversary_action_dim", 13))
         if self.env.num_actions <= self.adversary_action_dim:
             raise ValueError(
                 f"env.num_actions ({self.env.num_actions}) must be > adversary_action_dim ({self.adversary_action_dim})."
@@ -86,6 +102,13 @@ class MultiAgentRunner:
             action_dim=self.adversary_action_dim,
             storage_horizon=1,
         )
+        initial_reset_probs = self.cfg.get("adversary_initial_reset_probs")
+        if initial_reset_probs is not None:
+            # UWLab convention: prob logits are the last K dims of the adversary action (K = len(initial_reset_probs)).
+            start_idx = int(self.adversary_action_dim - len(initial_reset_probs))
+            _init_adversary_reset_prob_logits(
+                self.alg_adversary.policy, initial_reset_probs, start_idx=start_idx, device=self.device
+            )
 
         # Decide whether to disable logging
         # Note: We only log from the process with rank 0 (main process)
