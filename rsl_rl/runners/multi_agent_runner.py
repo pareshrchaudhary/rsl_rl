@@ -25,19 +25,25 @@ from rsl_rl.utils import resolve_obs_groups, store_code_state
 from rsl_rl.utils.logger import resolve_randomized_param_names, extract_randomized_params, log_multi_agent
 
 
-def _init_adversary_reset_prob_logits(policy, initial_probs: list[float], start_idx: int, device: torch.device) -> None:
-    """Set adversary actor's last-layer bias for prob indices so softmax(output) ~ initial_probs."""
+def _init_adversary_sigmoid_logits(
+    policy, initial_probs: list[float], action_indices: list[int], device: torch.device
+) -> None:
+    """Set adversary actor's last-layer bias for sigmoid outputs at specific action indices.
+
+    For target probability ``p``, the bias = ``log(p / (1 - p))`` (inverse sigmoid).
+    ``initial_probs[i]`` is applied at ``action_indices[i]``.
+    """
     actor = policy.actor
     linears = [m for m in actor.modules() if isinstance(m, nn.Linear)]
     if not linears:
         return
     last_linear = linears[-1]
-    probs = torch.tensor(initial_probs, device=device, dtype=last_linear.bias.dtype)
-    logits = torch.log(probs.clamp(min=1e-6))
-    end_idx = start_idx + len(initial_probs)
-    if end_idx <= last_linear.bias.shape[0]:
-        with torch.no_grad():
-            last_linear.bias[start_idx:end_idx] = logits
+    with torch.no_grad():
+        for idx, prob in zip(action_indices, initial_probs):
+            if idx < last_linear.bias.shape[0]:
+                p_clamped = max(min(prob, 0.99), 0.01)
+                logit = torch.log(torch.tensor(p_clamped / (1.0 - p_clamped), dtype=last_linear.bias.dtype, device=device))
+                last_linear.bias[idx] = logit
 
 
 class MultiAgentRunner:
@@ -65,7 +71,7 @@ class MultiAgentRunner:
         self.record_parameters = self.cfg.get("record_parameters", False)
 
         # Action split: policy controls robot, adversary controls last `adversary_action_dim` entries.
-        self.adversary_action_dim = int(self.cfg.get("adversary_action_dim", 13))
+        self.adversary_action_dim = int(self.cfg.get("adversary_action_dim", 27))
         if self.env.num_actions <= self.adversary_action_dim:
             raise ValueError(
                 f"env.num_actions ({self.env.num_actions}) must be > adversary_action_dim ({self.adversary_action_dim})."
@@ -102,12 +108,13 @@ class MultiAgentRunner:
             action_dim=self.adversary_action_dim,
             storage_horizon=1,
         )
-        initial_reset_probs = self.cfg.get("adversary_initial_reset_probs")
-        if initial_reset_probs is not None:
-            # UWLab convention: prob logits are the last K dims of the adversary action (K = len(initial_reset_probs)).
-            start_idx = int(self.adversary_action_dim - len(initial_reset_probs))
-            _init_adversary_reset_prob_logits(
-                self.alg_adversary.policy, initial_reset_probs, start_idx=start_idx, device=self.device
+        # Initialize adversary network biases for sigmoid outputs (grasp, assembly flags)
+        # List maps positionally to action indices [9, 11] (grasp_logit, assembly_logit)
+        initial_sigmoid_probs = self.cfg.get("adversary_initial_sigmoid_probs")
+        if initial_sigmoid_probs is not None:
+            _init_adversary_sigmoid_logits(
+                self.alg_adversary.policy, initial_sigmoid_probs,
+                action_indices=[9, 11], device=self.device
             )
 
         # Decide whether to disable logging
