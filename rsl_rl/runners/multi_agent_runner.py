@@ -71,11 +71,8 @@ class MultiAgentRunner:
         self.record_parameters = self.cfg.get("record_parameters", False)
 
         # Action split: policy controls robot, adversary controls last `adversary_action_dim` entries.
-        self.adversary_action_dim = int(self.cfg.get("adversary_action_dim", 27))
-        if self.env.num_actions <= self.adversary_action_dim:
-            raise ValueError(
-                f"env.num_actions ({self.env.num_actions}) must be > adversary_action_dim ({self.adversary_action_dim})."
-            )
+        self.adversary_action_dim = int(self.cfg.get("adversary_action_dim", 20))
+
         self.policy_action_dim = int(self.env.num_actions - self.adversary_action_dim)
         # Resolve parameter names for logging
         self.randomized_param_names = resolve_randomized_param_names(self.cfg)
