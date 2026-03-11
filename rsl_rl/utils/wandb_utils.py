@@ -21,8 +21,9 @@ class WandbSummaryWriter(SummaryWriter):
     def __init__(self, log_dir: str, flush_secs: int, cfg: dict) -> None:
         super().__init__(log_dir, flush_secs)
 
-        # Get the run name
-        run_name = os.path.split(log_dir)[-1]
+        # Get the run name: prefix with experiment_name (parent dir) for clarity in wandb
+        experiment_name = os.path.basename(os.path.dirname(log_dir))
+        run_name = f"{experiment_name}_{os.path.split(log_dir)[-1]}"
 
         try:
             project = cfg["wandb_project"]
