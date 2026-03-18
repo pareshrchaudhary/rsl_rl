@@ -25,12 +25,12 @@ from rsl_rl.utils import resolve_obs_groups, store_code_state
 from rsl_rl.utils.logger import resolve_randomized_param_names, extract_randomized_params, log_multi_agent
 
 
-def _init_adversary_sigmoid_logits(
+def _init_adversary_softmax_logits(
     policy, initial_probs: list[float], action_indices: list[int], device: torch.device
 ) -> None:
-    """Set adversary actor's last-layer bias for sigmoid outputs at specific action indices.
+    """Set adversary actor's last-layer bias for softmax outputs at specific action indices.
 
-    For target probability ``p``, the bias = ``log(p / (1 - p))`` (inverse sigmoid).
+    For target probabilities after softmax, bias = ``log(p_i)`` (up to additive constant).
     ``initial_probs[i]`` is applied at ``action_indices[i]``.
     """
     actor = policy.actor
@@ -42,7 +42,7 @@ def _init_adversary_sigmoid_logits(
         for idx, prob in zip(action_indices, initial_probs):
             if idx < last_linear.bias.shape[0]:
                 p_clamped = max(min(prob, 0.99), 0.01)
-                logit = torch.log(torch.tensor(p_clamped / (1.0 - p_clamped), dtype=last_linear.bias.dtype, device=device))
+                logit = torch.log(torch.tensor(p_clamped, dtype=last_linear.bias.dtype, device=device))
                 last_linear.bias[idx] = logit
 
 
@@ -68,11 +68,13 @@ class MultiAgentRunner:
         self.num_steps_per_env = self.cfg["num_steps_per_env"]
         self.adversary_update_every_k_episodes = self.cfg["adversary_update_every_k_episodes"]
         self.save_interval = self.cfg["save_interval"]
-        self.record_parameters = self.cfg.get("record_parameters", False)
+        self.record_parameters = self.cfg.get("record_parameters", True)
 
         # Action split: policy controls robot, adversary controls last `adversary_action_dim` entries.
-        self.adversary_action_dim = int(self.cfg.get("adversary_action_dim", 20))
-
+        # adversary_action_dim = adversary_robot_parameters + len(adversary_initial_reset_probs)
+        initial_reset_probs = self.cfg["adversary_initial_reset_probs"]
+        adversary_robot_params = self.cfg["adversary_robot_parameters"]
+        self.adversary_action_dim = adversary_robot_params + len(initial_reset_probs)
         self.policy_action_dim = int(self.env.num_actions - self.adversary_action_dim)
         # Resolve parameter names for logging
         self.randomized_param_names = resolve_randomized_param_names(self.cfg)
@@ -105,14 +107,13 @@ class MultiAgentRunner:
             action_dim=self.adversary_action_dim,
             storage_horizon=1,
         )
-        # Initialize adversary network biases for sigmoid outputs (grasp, assembly flags)
-        # List maps positionally to action indices [9, 11] (grasp_logit, assembly_logit)
-        initial_sigmoid_probs = self.cfg.get("adversary_initial_sigmoid_probs")
-        if initial_sigmoid_probs is not None:
-            _init_adversary_sigmoid_logits(
-                self.alg_adversary.policy, initial_sigmoid_probs,
-                action_indices=[9, 11], device=self.device
-            )
+        # Initialize adversary softmax outputs for reset state sampling probs
+        # Reset probs start after robot parameters (indices adversary_robot_parameters to adversary_action_dim-1)
+        action_indices = list(range(adversary_robot_params, self.adversary_action_dim))
+        _init_adversary_softmax_logits(
+            self.alg_adversary.policy, initial_reset_probs,
+            action_indices=action_indices, device=self.device
+        )
 
         # Decide whether to disable logging
         # Note: We only log from the process with rank 0 (main process)
