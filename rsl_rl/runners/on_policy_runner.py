@@ -17,7 +17,7 @@ from tensordict import TensorDict
 import rsl_rl
 from rsl_rl.algorithms import PPO
 from rsl_rl.env import VecEnv
-from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, AsymmetricActorCritic, resolve_rnd_config, resolve_symmetry_config
+from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, AsymmetricActorCritic, BCImageActorCritic, resolve_rnd_config, resolve_symmetry_config
 from rsl_rl.utils import resolve_obs_groups, store_code_state
 from rsl_rl.utils.logger import resolve_randomized_param_names, extract_randomized_params
 

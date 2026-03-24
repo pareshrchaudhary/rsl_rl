@@ -8,6 +8,7 @@
 from .actor_critic import ActorCritic
 from .actor_critic_recurrent import ActorCriticRecurrent
 from .asymmetric_actor_critic import AsymmetricActorCritic
+from .bc_image_actor_critic import BCImageActorCritic
 from .rnd import RandomNetworkDistillation, resolve_rnd_config
 from .student_teacher import StudentTeacher
 from .student_teacher_recurrent import StudentTeacherRecurrent
@@ -17,6 +18,7 @@ __all__ = [
     "ActorCritic",
     "ActorCriticRecurrent",
     "AsymmetricActorCritic",
+    "BCImageActorCritic",
     "RandomNetworkDistillation",
     "StudentTeacher",
     "StudentTeacherRecurrent",

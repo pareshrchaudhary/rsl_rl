@@ -39,18 +39,17 @@ class RolloutStorage:
         actions_shape: tuple[int] | list[int],
         device: str = "cpu",
     ) -> None:
+        assert training_type in ("rl", "distillation"), (
+            f"Unknown training_type '{training_type}'. Must be 'rl' or 'distillation'."
+        )
         self.training_type = training_type
         self.device = device
         self.num_transitions_per_env = num_transitions_per_env
         self.num_envs = num_envs
         self.actions_shape = actions_shape
 
-        # Core
-        self.observations = TensorDict(
-            {key: torch.zeros(num_transitions_per_env, *value.shape, device=device) for key, value in obs.items()},
-            batch_size=[num_transitions_per_env, num_envs],
-            device=self.device,
-        )
+        # Core observations (supports nested TensorDicts, e.g. image policy obs)
+        self.observations = self._create_obs_buffer(obs, num_transitions_per_env, num_envs, device)
         self.rewards = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
         self.actions = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
         self.dones = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device).byte()
@@ -75,8 +74,18 @@ class RolloutStorage:
         # Counter for the number of transitions stored
         self.step = 0
 
+    @staticmethod
+    def _create_obs_buffer(obs: TensorDict, num_transitions: int, num_envs: int, device: str) -> TensorDict:
+        """Create zero-filled observation buffer, handling nested TensorDicts."""
+        storage = {}
+        for key, value in obs.items():
+            if isinstance(value, TensorDict):
+                storage[key] = RolloutStorage._create_obs_buffer(value, num_transitions, num_envs, device)
+            else:
+                storage[key] = torch.zeros(num_transitions, *value.shape, device=device)
+        return TensorDict(storage, batch_size=[num_transitions, num_envs], device=device)
+
     def add_transitions(self, transition: Transition) -> None:
-        # Check if the transition is valid
         if self.step >= self.num_transitions_per_env:
             raise OverflowError("Rollout buffer overflow! You should call clear() before adding new transitions.")
 
@@ -185,12 +194,10 @@ class RolloutStorage:
 
         for epoch in range(num_epochs):
             for i in range(num_mini_batches):
-                # Select the indices for the mini-batch
                 start = i * mini_batch_size
                 stop = (i + 1) * mini_batch_size
                 batch_idx = indices[start:stop]
 
-                # Create the mini-batch
                 obs_batch = observations[batch_idx]
                 actions_batch = actions[batch_idx]
                 target_values_batch = values[batch_idx]
@@ -204,7 +211,6 @@ class RolloutStorage:
                 hidden_state_c_batch = None
                 masks_batch = None
 
-                # Yield the mini-batch
                 yield (
                     obs_batch,
                     actions_batch,
@@ -222,10 +228,7 @@ class RolloutStorage:
                 )
 
     def bandit_mini_batch_generator(self, num_mini_batches: int, num_epochs: int = 1) -> Generator:
-        """Mini-batch generator for bandit-style actor-only updates.
-
-        Yields rewards (treated as returns) instead of values/returns/advantages.
-        """
+        """Mini-batch generator for bandit-style actor-only updates."""
         if self.training_type != "rl":
             raise ValueError("This function is only available for reinforcement learning training.")
         batch_size = self.num_envs * self.num_transitions_per_env
@@ -291,8 +294,6 @@ class RolloutStorage:
                 # Reshape to [num_envs, time, num layers, hidden dim]
                 # Original shape: [time, num_layers, num_envs, hidden_dim])
                 last_was_done = last_was_done.permute(1, 0)
-                # Take only time steps after dones (flattens num envs and time dimensions),
-                # take a batch of trajectories and finally reshape back to [num_layers, batch, hidden_dim]
                 hidden_state_a_batch = [
                     saved_hidden_state.permute(2, 0, 1, 3)[last_was_done][first_traj:last_traj]
                     .transpose(1, 0)
@@ -317,7 +318,6 @@ class RolloutStorage:
                         hidden_state_c_batch[0] if len(hidden_state_c_batch) == 1 else hidden_state_c_batch
                     )
 
-                # Yield the mini-batch
                 yield (
                     obs_batch,
                     actions_batch,
