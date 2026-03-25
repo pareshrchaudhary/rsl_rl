@@ -117,23 +117,39 @@ def extract_randomized_params(
     params[:, 11] = (current_masses / (default_masses + 1e-8)).mean(dim=1)
 
     osc_action_term = env.unwrapped.action_manager._terms.get("arm")
-    controller = osc_action_term._osc
-    # Get current stiffness gains (diagonal of motion_p_gains_task)
-    current_stiffness_diag = torch.diagonal(controller._motion_p_gains_task[env_indices], dim1=-2, dim2=-1)
-    # Default stiffness from config (6 values: xyz, rpy)
-    default_stiffness = torch.tensor(controller.cfg.motion_stiffness_task, device=device)
-    # Extract scale from xyz block (use first element or mean)
-    current_stiffness_xyz = current_stiffness_diag[:, 0]  # First xyz element
-    default_stiffness_xyz = default_stiffness[0]
-    params[:, 16] = current_stiffness_xyz / (default_stiffness_xyz + 1e-8)
+    if osc_action_term is not None:
+        controller = getattr(osc_action_term, "_osc", None)
+        if controller is not None and hasattr(controller, "_motion_p_gains_task"):
+            # Isaac Lab task-space OSC (wrapped controller with gain matrices)
+            current_stiffness_diag = torch.diagonal(
+                controller._motion_p_gains_task[env_indices], dim1=-2, dim2=-1
+            )
+            default_stiffness = torch.tensor(controller.cfg.motion_stiffness_task, device=device)
+            current_stiffness_xyz = current_stiffness_diag[:, 0]
+            default_stiffness_xyz = default_stiffness[0]
+            params[:, 16] = current_stiffness_xyz / (default_stiffness_xyz + 1e-8)
 
-    # Get current damping gains and compute damping ratio
-    current_damping_diag = torch.diagonal(controller._motion_d_gains_task[env_indices], dim1=-2, dim2=-1)
-    # Damping = 2 * sqrt(stiffness) * damping_ratio, so damping_ratio = damping / (2 * sqrt(stiffness))
-    current_damping_ratio_xyz = current_damping_diag[:, 0] / (2 * current_stiffness_xyz.sqrt() + 1e-8)
-    default_damping_ratio = torch.tensor(controller.cfg.motion_damping_ratio_task, device=device)
-    default_damping_ratio_xyz = default_damping_ratio[0]
-    params[:, 17] = current_damping_ratio_xyz / (default_damping_ratio_xyz + 1e-8)
+            current_damping_diag = torch.diagonal(
+                controller._motion_d_gains_task[env_indices], dim1=-2, dim2=-1
+            )
+            current_damping_ratio_xyz = current_damping_diag[:, 0] / (
+                2 * current_stiffness_xyz.sqrt() + 1e-8
+            )
+            default_damping_ratio = torch.tensor(
+                controller.cfg.motion_damping_ratio_task, device=device
+            )
+            default_damping_ratio_xyz = default_damping_ratio[0]
+            params[:, 17] = current_damping_ratio_xyz / (default_damping_ratio_xyz + 1e-8)
+        elif hasattr(osc_action_term, "_kp") and hasattr(osc_action_term, "_kd"):
+            # RelCartesianOSCAction: per-env Kp/Kd vectors (Kd = 2*sqrt(Kp)*damping_ratio)
+            kp_s = osc_action_term._kp[env_indices]
+            kd_s = osc_action_term._kd[env_indices]
+            current_stiffness_xyz = kp_s[:, 0]
+            default_stiffness_xyz = osc_action_term._kp_default[0]
+            params[:, 16] = current_stiffness_xyz / (default_stiffness_xyz + 1e-8)
+            current_damping_ratio_xyz = kd_s[:, 0] / (2 * current_stiffness_xyz.sqrt() + 1e-8)
+            default_damping_ratio_xyz = osc_action_term._damping_ratio_default[0]
+            params[:, 17] = current_damping_ratio_xyz / (default_damping_ratio_xyz + 1e-8)
 
     return params
 
