@@ -65,6 +65,10 @@ class OnPolicyRunner:
         # Adversary parameter names and extractor from config (optional for single-agent runner)
         self.adversary_parameter_names = self.cfg.get("adversary_parameter_names", [])
         self.adversary_param_extractor_fn = self.cfg.get("adversary_param_extractor_fn", None)
+        # IsaacLab's configclass.to_dict() serializes callables as strings, so we
+        # can't trust a non-None value from cfg to actually be callable.
+        if not callable(self.adversary_param_extractor_fn):
+            self.adversary_param_extractor_fn = None
         if self.record_parameters and self.adversary_param_extractor_fn is None:
             self.record_parameters = False
 

@@ -53,7 +53,10 @@ class MultiAgentRunner:
         self.adversary_parameter_names = self.cfg["adversary_parameter_names"]
         self.record_parameters = self.cfg.get("record_parameters", True)
         self.adversary_param_extractor_fn = self.cfg.get("adversary_param_extractor_fn")
-        if self.record_parameters and self.adversary_param_extractor_fn is None:
+        # IsaacLab's configclass.to_dict() serializes callables as strings, so the
+        # function reference from the cfg becomes a str by the time it gets here.
+        # Fall back to the default extractor whenever the value isn't callable.
+        if not callable(self.adversary_param_extractor_fn):
             self.adversary_param_extractor_fn = extract_cage_physics_params
 
         # Query observations from environment for algorithm construction
