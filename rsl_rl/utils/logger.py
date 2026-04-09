@@ -10,56 +10,63 @@ import time
 import torch
 
 
-def resolve_randomized_param_names(cfg: dict) -> list[str]:
-    """Resolve randomized parameter names from config or return defaults.
-    
+def extract_adversary_params(
+    env,
+    device: str | torch.device,
+    is_distributed: bool = False,
+    gpu_world_size: int = 1,
+    gpu_global_rank: int = 0,
+    adversary_param_extractor_fn: callable | None = None,
+) -> torch.Tensor | None:
+    """Extract adversary-chosen parameters from environment.
+
     Args:
-        cfg: Configuration dictionary that may contain 'randomized_param_names'
-        
+        env: Environment instance.
+        device: Device to place tensors on.
+        is_distributed: Whether running in distributed mode.
+        gpu_world_size: Total number of GPU ranks.
+        gpu_global_rank: Current GPU rank.
+        adversary_param_extractor_fn: Callable that extracts parameters from the
+            environment for HDF5 storage. Signature:
+            (env, device, is_distributed, world_size, rank) -> Tensor(num_envs, N).
+            If None, extraction is skipped.
+
     Returns:
-        List of 18 parameter names
+        Tensor of shape (num_envs, N) containing adversary parameters, or None
+        if no extractor is provided.
     """
-    cfg_names = cfg.get("randomized_param_names", None)
-    if isinstance(cfg_names, (list, tuple)) and len(cfg_names) == 18:
-        return [str(x) for x in cfg_names]
-    return [
-        "robot_static_friction", "robot_dynamic_friction",
-        "insertive_object_static_friction", "insertive_object_dynamic_friction",
-        "receptive_object_static_friction", "receptive_object_dynamic_friction",
-        "table_static_friction", "table_dynamic_friction",
-        "robot_mass_scale", "insertive_object_mass_scale",
-        "receptive_object_mass_scale", "table_mass_scale",
-        "robot_joint_friction_scale", "robot_joint_armature_scale",
-        "gripper_stiffness_scale", "gripper_damping_scale",
-        "osc_stiffness_scale", "osc_damping_scale",
-    ]
+    if adversary_param_extractor_fn is None:
+        return None
+    return adversary_param_extractor_fn(env, device, is_distributed, gpu_world_size, gpu_global_rank)
 
 
-def extract_randomized_params(
+def extract_cage_physics_params(
     env,
     device: str | torch.device,
     is_distributed: bool = False,
     gpu_world_size: int = 1,
     gpu_global_rank: int = 0,
 ) -> torch.Tensor:
-    """Extract randomized parameters from environment.
-    
-    Args:
-        env: Environment instance with unwrapped.scene attribute
-        device: Device to place tensors on
-        is_distributed: Whether running in distributed mode
-        gpu_world_size: Total number of GPU ranks
-        gpu_global_rank: Current GPU rank
-        
-    Returns:
-        Tensor of shape (num_envs, 18) containing randomized parameters
+    """Extract CAGE physics parameters from environment scene.
+
+    Returns a tensor of shape (num_envs, 18) with columns:
+        0-1: robot static/dynamic friction
+        2-3: insertive object static/dynamic friction
+        4-5: receptive object static/dynamic friction
+        6-7: table static/dynamic friction
+        8: robot mass scale
+        9: insertive object mass scale
+        10: receptive object mass scale
+        11: table mass scale
+        12: robot joint friction scale
+        13: robot joint armature scale
+        14: gripper stiffness scale
+        15: gripper damping scale
+        16: OSC stiffness scale
+        17: OSC damping scale
     """
-    # In distributed training, each rank should only extract from its assigned environments
-    # If env.num_envs returns total, we need to determine per-rank subset
     total_envs = env.num_envs
     if is_distributed:
-        # Calculate which environments belong to this rank
-        # Typically: rank R handles environments [R * (N/W) : (R+1) * (N/W)]
         envs_per_rank = total_envs // gpu_world_size
         start_env = gpu_global_rank * envs_per_rank
         end_env = start_env + envs_per_rank if gpu_global_rank < gpu_world_size - 1 else total_envs
@@ -68,7 +75,7 @@ def extract_randomized_params(
     else:
         num_envs = total_envs
         env_indices = slice(None)
-    
+
     params = torch.zeros((num_envs, 18), dtype=torch.float, device=device)
     scene = env.unwrapped.scene
 
@@ -120,7 +127,6 @@ def extract_randomized_params(
     if osc_action_term is not None:
         controller = getattr(osc_action_term, "_osc", None)
         if controller is not None and hasattr(controller, "_motion_p_gains_task"):
-            # Isaac Lab task-space OSC (wrapped controller with gain matrices)
             current_stiffness_diag = torch.diagonal(
                 controller._motion_p_gains_task[env_indices], dim1=-2, dim2=-1
             )
@@ -141,7 +147,6 @@ def extract_randomized_params(
             default_damping_ratio_xyz = default_damping_ratio[0]
             params[:, 17] = current_damping_ratio_xyz / (default_damping_ratio_xyz + 1e-8)
         elif hasattr(osc_action_term, "_kp") and hasattr(osc_action_term, "_kd"):
-            # RelCartesianOSCAction: per-env Kp/Kd vectors (Kd = 2*sqrt(Kp)*damping_ratio)
             kp_s = osc_action_term._kp[env_indices]
             kd_s = osc_action_term._kd[env_indices]
             current_stiffness_xyz = kp_s[:, 0]
@@ -162,7 +167,6 @@ def log_multi_agent(
     gpu_world_size: int,
     alg,
     alg_adversary,
-    randomized_param_names: list[str],
     logger_type: str,
     tot_timesteps: int,
     tot_time: float,
@@ -180,7 +184,6 @@ def log_multi_agent(
         gpu_world_size: Total number of GPU ranks
         alg: Main algorithm instance
         alg_adversary: Adversary algorithm instance
-        randomized_param_names: List of randomized parameter names
         logger_type: Type of logger (tensorboard, wandb, neptune)
         tot_timesteps: Total timesteps so far
         tot_time: Total time elapsed so far
@@ -241,24 +244,6 @@ def log_multi_agent(
     writer.add_scalar("Perf/total_fps", fps, locs["it"])
     writer.add_scalar("Perf/collection time", locs["collection_time"], locs["it"])
     writer.add_scalar("Perf/learning_time", locs["learn_time"], locs["it"])
-
-    # Log adversary parameters (aggregated over rollout window)
-    if (
-        "param_mean" in locs
-        and "param_std" in locs
-        and "param_min_v" in locs
-        and "param_max_v" in locs
-    ):
-        for i, (m, s, mn, mx) in enumerate(
-            zip(locs["param_mean"], locs["param_std"], locs["param_min_v"], locs["param_max_v"])
-        ):
-            name = randomized_param_names[i] if i < len(randomized_param_names) else f"dim_{i}"
-            sanitized = "".join(c if (c.isalnum() or c in ("_", "-")) else "_" for c in name)
-            tag = f"action_{i:02d}_{sanitized}"
-            writer.add_scalar(f"adversary_actions/{tag}/mean", float(m), locs["it"])
-            writer.add_scalar(f"adversary_actions/{tag}/std", float(s), locs["it"])
-            writer.add_scalar(f"adversary_actions/{tag}/min", float(mn), locs["it"])
-            writer.add_scalar(f"adversary_actions/{tag}/max", float(mx), locs["it"])
 
     # Log rollout-batch metrics (independent of completed episodes)
     if (

@@ -20,7 +20,7 @@ from rsl_rl.algorithms.simple_ppo import SimplePPO
 from rsl_rl.env import VecEnv
 from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, AsymmetricActorCritic, resolve_symmetry_config
 from rsl_rl.utils import resolve_obs_groups, store_code_state
-from rsl_rl.utils.logger import resolve_randomized_param_names, extract_randomized_params, log_multi_agent
+from rsl_rl.utils.logger import extract_adversary_params, extract_cage_physics_params, log_multi_agent
 
 
 class MultiAgentRunner:
@@ -45,13 +45,16 @@ class MultiAgentRunner:
         self.num_steps_per_env = self.cfg["num_steps_per_env"]
         self.adversary_update_every_k_episodes = self.cfg["adversary_update_every_k_episodes"]
         self.save_interval = self.cfg["save_interval"]
-        self.record_parameters = self.cfg.get("record_parameters", True)
 
         # Action split: policy controls robot, adversary controls last `adversary_action_dim` entries.
         self.adversary_action_dim = self.cfg["adversary_robot_parameters"]
         self.policy_action_dim = int(self.env.num_actions - self.adversary_action_dim)
-        # Resolve parameter names for logging
-        self.randomized_param_names = resolve_randomized_param_names(self.cfg)
+        # Adversary parameter names and extractor from config
+        self.adversary_parameter_names = self.cfg["adversary_parameter_names"]
+        self.record_parameters = self.cfg.get("record_parameters", True)
+        self.adversary_param_extractor_fn = self.cfg.get("adversary_param_extractor_fn")
+        if self.record_parameters and self.adversary_param_extractor_fn is None:
+            self.adversary_param_extractor_fn = extract_cage_physics_params
 
         # Query observations from environment for algorithm construction
         obs = self.env.get_observations()
@@ -131,7 +134,7 @@ class MultiAgentRunner:
             # Initialize HDF5 file with metadata if it doesn't exist (only from rank 0)
             if not self.disable_logs and not os.path.exists(param_h5_path):
                 with h5py.File(param_h5_path, "w") as f:
-                    f.attrs["param_names"] = [n.encode("utf-8") for n in self.randomized_param_names]
+                    f.attrs["param_names"] = [n.encode("utf-8") for n in self.adversary_parameter_names]
         
         raw_params_list = []
         policy_iteration_count = 0  # Count policy updates since last adversary update
@@ -155,12 +158,14 @@ class MultiAgentRunner:
             batch_episode_count = torch.tensor(0.0, dtype=torch.float, device=self.device)
             batch_episode_reward_max = torch.tensor(float("-inf"), dtype=torch.float, device=self.device)
 
-            # Extract parameters once per iteration
-            randomized_params = extract_randomized_params(
-                self.env, self.device, self.is_distributed, self.gpu_world_size, self.gpu_global_rank
-            )
-            # Store raw parameters (keep on GPU for distributed gather)
-            raw_params_list.append(randomized_params.detach())
+            # Extract adversary-chosen parameters once per iteration
+            if self.record_parameters:
+                adversary_params = extract_adversary_params(
+                    self.env, self.device, self.is_distributed, self.gpu_world_size, self.gpu_global_rank,
+                    adversary_param_extractor_fn=self.adversary_param_extractor_fn,
+                )
+                if adversary_params is not None:
+                    raw_params_list.append(adversary_params.detach())
 
             # Rollout
             for _ in range(self.num_steps_per_env):
@@ -232,38 +237,17 @@ class MultiAgentRunner:
             collection_time = stop - start
             start = stop
 
-            # Compute randomized parameter stats directly from collected batch
-            all_params_cpu = None  # Store for HDF5 saving
+            # Gather adversary parameters for HDF5 only (rank 0 holds concatenated CPU tensor)
+            all_params_cpu = None
             if raw_params_list:
-                # Extract the single parameter tensor (one per environment per iteration)
-                raw_params_tensor = raw_params_list[0]  # (num_envs, 19) on GPU
-                
+                raw_params_tensor = raw_params_list[0]  # (num_envs, N) on GPU
                 if self.is_distributed:
-                    # Gather from all ranks
                     gathered = [torch.zeros_like(raw_params_tensor) for _ in range(self.gpu_world_size)]
                     torch.distributed.all_gather(gathered, raw_params_tensor)
-                    # Concatenate all ranks' data
                     if self.gpu_global_rank == 0:
-                        all_params = torch.cat(gathered, dim=0)
-                        all_params_cpu = all_params.cpu()  # Store for HDF5 saving
-                    else:
-                        all_params = None
+                        all_params_cpu = torch.cat(gathered, dim=0).cpu()
                 else:
-                    all_params = raw_params_tensor
-                    all_params_cpu = all_params.cpu()  # Store for HDF5 saving
-                
-                # Compute statistics from the batch (on rank 0 or non-distributed)
-                if all_params is not None and all_params.shape[0] > 0:
-                    param_mean = all_params.mean(dim=0).cpu().tolist()
-                    param_std = all_params.std(dim=0).cpu().tolist()
-                    param_min_v = all_params.min(dim=0).values.cpu().tolist()
-                    param_max_v = all_params.max(dim=0).values.cpu().tolist()
-                else:
-                    zeros = [0.0] * 19
-                    param_mean = param_std = param_min_v = param_max_v = zeros
-            else:
-                zeros = [0.0] * 19
-                param_mean = param_std = param_min_v = param_max_v = zeros
+                    all_params_cpu = raw_params_tensor.cpu()
 
             # Compute returns
             with torch.inference_mode():
@@ -349,7 +333,6 @@ class MultiAgentRunner:
                         gpu_world_size=self.gpu_world_size,
                         alg=self.alg,
                         alg_adversary=self.alg_adversary,
-                        randomized_param_names=self.randomized_param_names,
                         logger_type=self.logger_type,
                         tot_timesteps=self.tot_timesteps,
                         tot_time=self.tot_time,
@@ -358,7 +341,7 @@ class MultiAgentRunner:
                     # Save model
                     if it % self.save_interval == 0:
                         self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
-                # Save raw parameters to HDF5 (reuse gathered data from statistics computation)
+                # Save raw parameters to HDF5 (reuse gathered tensor from rollout)
                 if self.record_parameters and all_params_cpu is not None and param_h5_path:
                     with h5py.File(param_h5_path, "a") as f:
                         group = f.create_group(f"iteration_{it}")
