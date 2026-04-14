@@ -174,6 +174,17 @@ class SimplePPO:
 
             self.optimizer.zero_grad()
             loss.backward()
+            if self.is_multi_gpu:
+                grads = [p.grad.view(-1) for p in self.policy.parameters() if p.grad is not None]
+                all_grads = torch.cat(grads)
+                torch.distributed.all_reduce(all_grads, op=torch.distributed.ReduceOp.SUM)
+                all_grads /= self.gpu_world_size
+                offset = 0
+                for p in self.policy.parameters():
+                    if p.grad is not None:
+                        numel = p.grad.numel()
+                        p.grad.copy_(all_grads[offset : offset + numel].view_as(p.grad))
+                        offset += numel
             torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
             self.optimizer.step()
 
