@@ -5,6 +5,7 @@
 
 """Implementation of transitions storage for RL-agent."""
 
+from .reset_state_buffer import ResetStateBuffer
 from .rollout_storage import RolloutStorage
 
-__all__ = ["RolloutStorage"]
+__all__ = ["ResetStateBuffer", "RolloutStorage"]

@@ -289,9 +289,11 @@ def log_multi_agent(
         log_string += f"""{"Mean reward:":>{pad}} {statistics.mean(locs["rewbuffer"]):.2f}\n"""
         if "adv_rewbuffer" in locs and len(locs["adv_rewbuffer"]) > 0:
             log_string += f"""{f"Mean adversary regret:":>{pad}} {statistics.mean(locs["adv_rewbuffer"]):.2f}\n"""
-        # Print regret metrics
-        log_string += f"""{"Max batch reward:":>{pad}} {locs["max_batch_total_reward"]:.2f}\n"""
-        log_string += f"""{"Regret:":>{pad}} {locs["regret"]:.2f}\n"""
+        # Print regret metrics (batch max/mean over Phase B episodes that actually terminated)
+        log_string += f"""{"Batch episode count:":>{pad}} {int(locs.get("batch_episode_count", 0))}\n"""
+        log_string += f"""{"Max batch reward:":>{pad}} {locs["max_batch_total_reward"]:.4f}\n"""
+        log_string += f"""{"Mean batch reward:":>{pad}} {locs["mean_batch_total_reward"]:.4f}\n"""
+        log_string += f"""{"Regret (batch max-mean):":>{pad}} {locs["regret"]:.4f}\n"""
         # Print episode information
         log_string += f"""{"Mean episode length:":>{pad}} {statistics.mean(locs["lenbuffer"]):.2f}\n"""
     else:
@@ -305,8 +307,10 @@ def log_multi_agent(
         for key, value in locs["loss_dict"].items():
             log_string += f"""{f"{key}:":>{pad}} {value:.4f}\n"""
         if "max_batch_total_reward" in locs and "regret" in locs:
-            log_string += f"""{"Max batch reward:":>{pad}} {locs["max_batch_total_reward"]:.2f}\n"""
-            log_string += f"""{"Regret:":>{pad}} {locs["regret"]:.2f}\n"""
+            log_string += f"""{"Batch episode count:":>{pad}} {int(locs.get("batch_episode_count", 0))}\n"""
+            log_string += f"""{"Max batch reward:":>{pad}} {locs["max_batch_total_reward"]:.4f}\n"""
+            log_string += f"""{"Mean batch reward:":>{pad}} {locs["mean_batch_total_reward"]:.4f}\n"""
+            log_string += f"""{"Regret (batch max-mean):":>{pad}} {locs["regret"]:.4f}\n"""
 
     log_string += ep_string
     log_string += (

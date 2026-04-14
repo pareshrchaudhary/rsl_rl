@@ -14,7 +14,6 @@ from .utils import (
     string_to_callable,
     unpad_trajectories,
 )
-
 __all__ = [
     "resolve_nn_activation",
     "resolve_obs_groups",
