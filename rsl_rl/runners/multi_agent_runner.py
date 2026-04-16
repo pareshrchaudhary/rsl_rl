@@ -202,7 +202,16 @@ class MultiAgentRunner:
     # =====================================================================
 
     def _run_phase_a_refill(self, obs):
-        """Run Phase A, refill buffer, re-pin envs. Returns (obs, gen_stats, generation_time)."""
+        """Run Phase A, refill buffer, re-pin envs. Returns (obs, gen_stats, generation_time).
+
+        After the force-reset, randomize ``episode_length_buf`` so env episodes
+        truncate at different times in the first rollouts of the new cycle.
+        Without this desynchronization, all envs finish their first full episode
+        in the same rollout window and per-iter metrics become very spiky
+        (alternating between ~0 and ~num_envs episode completions). Stock
+        ``OnPolicyRunner`` does the same thing at learn-start via
+        ``init_at_random_ep_len=True``; we need it at every Phase A refill too.
+        """
         gen_start = time.time()
         self.env.unwrapped.cfg.episode_length_s = self.generation_episode_length_s
         self.env.unwrapped.reset_state_buffer = None
@@ -217,6 +226,10 @@ class MultiAgentRunner:
         with torch.inference_mode():
             all_env_ids = torch.arange(self.env.num_envs, device=self.device)
             self.env.unwrapped._reset_idx(all_env_ids)
+            # Desynchronize episode timing across envs for smooth per-iter metrics.
+            self.env.episode_length_buf = torch.randint_like(
+                self.env.episode_length_buf, high=int(self.env.max_episode_length)
+            )
             obs = self.env.get_observations().to(self.device)
 
         return obs, gen_stats, time.time() - gen_start
@@ -293,6 +306,11 @@ class MultiAgentRunner:
 
         per_slot_returns: list[list[float]] = [[] for _ in range(self.env.num_envs)]
         slot_credited: list[bool] = [False] * self.env.num_envs
+        # After every Phase A refill we randomize `episode_length_buf` to
+        # desynchronize episode endings. The first `done` event per env
+        # post-refill is therefore a truncated remnant, not a representative
+        # episode — drop it from metrics and adversary credit.
+        first_post_refill: list[bool] = [True] * self.env.num_envs
         iters_in_cycle: int = 0
         num_cycles_completed: int = 0
 
@@ -327,15 +345,28 @@ class MultiAgentRunner:
                 if done_ids.numel() > 0:
                     done_env_indices = done_ids[:, 0]
                     ep_returns = cur_reward_sum[done_ids][:, 0]
+                    cur_lens = cur_episode_length[done_ids][:, 0]
 
                     done_env_list = done_env_indices.cpu().numpy().tolist()
                     ep_returns_list = ep_returns.cpu().numpy().tolist()
-                    for env_idx, ret in zip(done_env_list, ep_returns_list):
-                        per_slot_returns[env_idx].append(ret)
+                    cur_lens_list = cur_lens.cpu().numpy().tolist()
 
-                    if self.log_dir is not None:
-                        rewbuffer.extend(ep_returns_list)
-                        lenbuffer.extend(cur_episode_length[done_ids][:, 0].cpu().numpy().tolist())
+                    # Filter out each env's first post-refill episode: its
+                    # return is a truncated remnant from the randomized
+                    # episode_length_buf desync, not a representative episode.
+                    counted_rets: list[float] = []
+                    counted_lens: list[float] = []
+                    for env_idx, ret, ep_len in zip(done_env_list, ep_returns_list, cur_lens_list):
+                        if first_post_refill[env_idx]:
+                            first_post_refill[env_idx] = False
+                            continue
+                        per_slot_returns[env_idx].append(ret)
+                        counted_rets.append(ret)
+                        counted_lens.append(ep_len)
+
+                    if self.log_dir is not None and counted_rets:
+                        rewbuffer.extend(counted_rets)
+                        lenbuffer.extend(counted_lens)
 
                     cur_reward_sum[done_ids] = 0
                     cur_episode_length[done_ids] = 0
@@ -466,12 +497,21 @@ class MultiAgentRunner:
                             adv_tuples, combined_rewards, last_obs=obs,
                         )
 
+                if cycle_complete and not force_refill:
+                    total_eps = sum(len(s) for s in per_slot_returns)
+                    print(
+                        f"[cycle-complete] iter={it} cycle={num_cycles_completed} "
+                        f"iters={iters_in_cycle} K={regret_k} "
+                        f"total_episodes={total_eps} → refilling Phase A"
+                    )
+
                 # Refill with the *current* (just-updated) adversary policy
                 obs, gen_stats, generation_time = self._run_phase_a_refill(obs)
                 cur_reward_sum.zero_()
                 cur_episode_length.zero_()
                 per_slot_returns = [[] for _ in range(self.env.num_envs)]
                 slot_credited = [False] * self.env.num_envs
+                first_post_refill = [True] * self.env.num_envs
                 num_cycles_completed += 1
                 iters_in_cycle = 0
 
