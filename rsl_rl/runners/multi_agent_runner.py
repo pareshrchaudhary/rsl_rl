@@ -505,6 +505,12 @@ class MultiAgentRunner:
                         f"total_episodes={total_eps} → refilling Phase A"
                     )
 
+                # Log per-slot regret distribution before discarding the buffer.
+                # Key metric: kept_top50_over_mean ≥ 1.5 means high-regret slots
+                # are being wasted → consider selective refill instead of full clear.
+                if self.log_dir is not None and not self.disable_logs:
+                    self._log_buffer_diagnostics(per_slot_returns, it)
+
                 # Refill with the *current* (just-updated) adversary policy
                 obs, gen_stats, generation_time = self._run_phase_a_refill(obs)
                 cur_reward_sum.zero_()
@@ -694,16 +700,7 @@ class MultiAgentRunner:
     def _log_buffer_diagnostics(
         self, per_env_episode_returns: list[list[float]], it: int
     ) -> None:
-        """Diagnose whether the current "clear + regenerate every iter" buffer
-        policy is wasting high-regret reset states.
-
-        Answers two questions:
-          1. Would keeping the top-K% of slots by regret preserve meaningfully
-             more curriculum signal than the iteration mean? (hypothetical
-             retention ratio)
-          2. What fraction of slots carried any learning signal at all
-             (informative = sometimes solved, sometimes not)?
-        """
+        """Log per-slot regret distribution before a Phase A refill."""
         returns_with_data = [r for r in per_env_episode_returns if len(r) > 0]
         n = len(returns_with_data)
         if n == 0:
@@ -713,40 +710,25 @@ class MultiAgentRunner:
         mean_t = torch.tensor(
             [sum(r) / len(r) for r in returns_with_data], dtype=torch.float, device=self.device
         )
-        min_t = torch.tensor([min(r) for r in returns_with_data], dtype=torch.float, device=self.device)
         regret_t = max_t - mean_t
 
         regret_mean = regret_t.mean().item()
         regret_max = regret_t.max().item()
         regret_p90 = torch.sort(regret_t).values[min(int(0.9 * n), n - 1)].item()
 
-        # Hypothetical: keep top 50% by regret — how much more informative is
-        # the kept half than the full-buffer mean? Ratio ≈ 1 → eviction pointless;
-        # ≥ 1.5 → persistent buffer likely worth building.
         k = max(1, n // 2)
         kept_top50 = torch.topk(regret_t, k, largest=True).values.mean().item()
         kept_top50_over_mean = kept_top50 / max(regret_mean, 1e-8)
-
-        # Signal-per-slot: what fraction of slots actually produced learning signal?
-        solved_mask = max_t > SOLVED_THRESHOLD
-        consistent_mask = (max_t - min_t) < 1e-6
-        frac_always_solved = float((consistent_mask & solved_mask).float().mean().item())
-        frac_never_solved = float((consistent_mask & ~solved_mask).float().mean().item())
-        frac_informative = 1.0 - frac_always_solved - frac_never_solved
 
         w = self.writer
         w.add_scalar("BufferDiag/regret_mean", regret_mean, it)
         w.add_scalar("BufferDiag/regret_p90", regret_p90, it)
         w.add_scalar("BufferDiag/regret_max", regret_max, it)
         w.add_scalar("BufferDiag/kept_top50_over_mean", kept_top50_over_mean, it)
-        w.add_scalar("BufferDiag/frac_informative", frac_informative, it)
-        w.add_scalar("BufferDiag/frac_always_solved", frac_always_solved, it)
-        w.add_scalar("BufferDiag/frac_never_solved", frac_never_solved, it)
 
         print(
-            f"[BufferDiag] regret: mean={regret_mean:.3f} p90={regret_p90:.3f} max={regret_max:.3f} | "
-            f"informative={frac_informative:.3f} (always={frac_always_solved:.3f}, "
-            f"never={frac_never_solved:.3f}) | kept_top50/mean={kept_top50_over_mean:.3f}"
+            f"[BufferDiag] regret: mean={regret_mean:.3f} p90={regret_p90:.3f} "
+            f"max={regret_max:.3f} | kept_top50/mean={kept_top50_over_mean:.3f}"
         )
 
     # =====================================================================
