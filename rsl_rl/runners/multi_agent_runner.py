@@ -198,6 +198,51 @@ class MultiAgentRunner:
         return idx
 
     # =====================================================================
+    # Cycle helpers
+    # =====================================================================
+
+    def _run_phase_a_refill(self, obs):
+        """Run Phase A, refill buffer, re-pin envs. Returns (obs, gen_stats, generation_time)."""
+        gen_start = time.time()
+        self.env.unwrapped.cfg.episode_length_s = self.generation_episode_length_s
+        self.env.unwrapped.reset_state_buffer = None
+
+        gen_stats = self._run_generation_loop(obs)
+        obs = gen_stats["final_obs"]
+
+        self.env.unwrapped.cfg.episode_length_s = self.training_episode_length_s
+        self.env.unwrapped.reset_state_buffer = self.state_buffer
+        self.state_buffer.reset_per_env_tracking()
+
+        with torch.inference_mode():
+            all_env_ids = torch.arange(self.env.num_envs, device=self.device)
+            self.env.unwrapped._reset_idx(all_env_ids)
+            obs = self.env.get_observations().to(self.device)
+
+        return obs, gen_stats, time.time() - gen_start
+
+    def _prepare_adversary_storage(self, n: int, obs_spec) -> None:
+        """Reinit alg_adversary.storage for a variable-width batch of size n (horizon=1)."""
+        self.alg_adversary.init_storage(
+            "rl",
+            num_envs=n,
+            num_transitions_per_env=1,
+            obs=obs_spec,
+            actions_shape=[self.adversary_action_dim],
+        )
+
+    def _select_adv_tuples(self, adv_tuples_full: dict, idx_t: torch.Tensor) -> dict:
+        """Slice a full per-env adversary-tuple dict to just the given slot indices."""
+        return {
+            "obs":        {k: v[idx_t].clone() for k, v in adv_tuples_full["obs"].items()},
+            "action":     adv_tuples_full["action"][idx_t].clone(),
+            "log_prob":   adv_tuples_full["log_prob"][idx_t].clone(),
+            "mu":         adv_tuples_full["mu"][idx_t].clone(),
+            "sigma":      adv_tuples_full["sigma"][idx_t].clone(),
+            "gen_reward": adv_tuples_full["gen_reward"][idx_t].clone(),
+        }
+
+    # =====================================================================
     # Main training loop
     # =====================================================================
 
@@ -227,203 +272,210 @@ class MultiAgentRunner:
         tot_iter = start_iter + num_learning_iterations
         last_adv_loss_dict_mean: dict[str, float] | None = None
 
-        # Per-env episode return tracking for adversary regret
-        per_env_episode_returns: list[list[float]] = [[] for _ in range(self.env.num_envs)]
-        adversary_update_every_n_episodes = self.cfg.get("adversary_update_every_n_episodes", 1)
+        # K-episode cycle: Phase A refills buffer at cycle end, PPO runs stock
+        # OnPolicyRunner iterations with sticky pinning, each slot is credited
+        # to the adversary exactly once when it banks `regret_k` episodes.
+        regret_k = int(self.cfg.get("regret_k", 3))
+        max_iters_per_cycle = int(self.cfg.get("max_iters_per_cycle", 50))
+
+        # Phase B adversary slice is inert: the only reset event that fires
+        # is the buffer reset (which ignores raw_actions), no obs term reads
+        # the adversary action, and no reward term references it. Feed zeros
+        # just to satisfy the env's action-width expectation.
+        phase_b_adversary_actions = torch.zeros(
+            (self.env.num_envs, self.adversary_action_dim), device=self.device
+        )
+
+        # Bootstrap: one Phase A refill before the first iteration
+        obs, _gen_stats_initial, _ = self._run_phase_a_refill(obs)
+        cur_reward_sum.zero_()
+        cur_episode_length.zero_()
+
+        per_slot_returns: list[list[float]] = [[] for _ in range(self.env.num_envs)]
+        slot_credited: list[bool] = [False] * self.env.num_envs
+        iters_in_cycle: int = 0
+        num_cycles_completed: int = 0
 
         for it in range(start_iter, tot_iter):
-            start = time.time()
+            gen_stats = None
+            generation_time = 0.0
+            iters_in_cycle += 1
 
-            # =================================================================
-            # Phase A: Adversary Generation (short 2s settling episodes)
-            # =================================================================
-            self.env.unwrapped.cfg.episode_length_s = self.generation_episode_length_s
-            self.env.unwrapped.reset_state_buffer = None
+            # ── Phase B: stock OnPolicyRunner rollout ──
+            collection_start = time.time()
 
-            gen_stats = self._run_generation_loop(obs)
-            obs = gen_stats["final_obs"]
-
-            # =================================================================
-            # Switch to training mode (long 16s episodes, buffer-loaded resets)
-            # =================================================================
-            self.env.unwrapped.cfg.episode_length_s = self.training_episode_length_s
-            self.env.unwrapped.reset_state_buffer = self.state_buffer
-            self.state_buffer.reset_per_env_tracking()
-
-            # Force-reset ALL envs so Phase B starts from validated buffer states,
-            # not leftover garbage from Phase A generation. Each env is pinned to
-            # the slot it draws here for the rest of Phase B (see buffer sample_for_envs).
-            with torch.inference_mode():
-                all_env_ids = torch.arange(self.env.num_envs, device=self.device)
-                self.env.unwrapped._reset_idx(all_env_ids)
-                obs = self.env.get_observations().to(self.device)
-            cur_reward_sum.zero_()
-            cur_episode_length.zero_()
-
-            # Phase B adversary slice is inert: the only reset event that fires
-            # is the buffer reset (which ignores raw_actions), no obs term reads
-            # the adversary action, and no reward term references it. Feed zeros
-            # just to satisfy the env's action-width expectation.
-            phase_b_adversary_actions = torch.zeros(
-                (self.env.num_envs, self.adversary_action_dim), device=self.device
-            )
-
-            # Reset per-env episode return tracking for this iteration. Phase B
-            # will keep rolling until every env has completed ≥ N full episodes.
-            per_env_episode_returns = [[] for _ in range(self.env.num_envs)]
-
-            # =================================================================
-            # Phase B: Policy Training Rollout — loop until every env has
-            # completed `adversary_update_every_n_episodes` full episodes.
-            # =================================================================
-            batch_episode_reward_sum = torch.tensor(0.0, dtype=torch.float, device=self.device)
-            batch_episode_count = torch.tensor(0.0, dtype=torch.float, device=self.device)
-            batch_episode_reward_max = torch.tensor(float("-inf"), dtype=torch.float, device=self.device)
-            loss_dict: dict = {}
-            num_policy_updates = 0
-
-            while True:
-                for _ in range(self.num_steps_per_env):
-                    with torch.inference_mode():
-                        policy_actions = self.alg.act(obs)
-                        actions = torch.cat([policy_actions, phase_b_adversary_actions], dim=-1)
-
-                        obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
-                        obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
-
-                        self.alg.process_env_step(obs, rewards, dones, extras)
-
-                        if self.log_dir is not None:
-                            if "episode" in extras:
-                                ep_infos.append(extras["episode"])
-                            elif "log" in extras:
-                                ep_infos.append(extras["log"])
-
-                        done_ids = (dones > 0).nonzero(as_tuple=False)
-                        cur_reward_sum += rewards
-                        cur_episode_length += 1
-
-                    if done_ids.numel() > 0:
-                        done_env_indices = done_ids[:, 0]
-                        ep_returns = cur_reward_sum[done_ids][:, 0]
-
-                        done_env_list = done_env_indices.cpu().numpy().tolist()
-                        ep_returns_list = ep_returns.cpu().numpy().tolist()
-                        for env_idx, ret in zip(done_env_list, ep_returns_list):
-                            per_env_episode_returns[env_idx].append(ret)
-
-                        if self.log_dir is not None:
-                            batch_episode_reward_sum += ep_returns.sum()
-                            batch_episode_count += float(ep_returns.numel())
-                            batch_episode_reward_max = torch.maximum(batch_episode_reward_max, ep_returns.max())
-                            rewbuffer.extend(ep_returns_list)
-                            lenbuffer.extend(cur_episode_length[done_ids][:, 0].cpu().numpy().tolist())
-
-                        cur_reward_sum[done_ids] = 0
-                        cur_episode_length[done_ids] = 0
-
-                # Policy PPO update at the end of each num_steps_per_env chunk.
+            for _ in range(self.num_steps_per_env):
                 with torch.inference_mode():
-                    self.alg.compute_returns(obs)
-                loss_dict = self.alg.update()
-                num_policy_updates += 1
+                    policy_actions = self.alg.act(obs)
+                    actions = torch.cat([policy_actions, phase_b_adversary_actions], dim=-1)
 
-                # Gate: stop Phase B once every env has completed ≥ N episodes.
-                min_episodes_so_far = min(len(r) for r in per_env_episode_returns)
-                if min_episodes_so_far >= adversary_update_every_n_episodes:
-                    break
+                    obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
+                    obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
 
-            # Aggregate regret metrics across GPUs
-            if self.is_distributed:
-                torch.distributed.all_reduce(batch_episode_reward_sum, op=torch.distributed.ReduceOp.SUM)
-                torch.distributed.all_reduce(batch_episode_count, op=torch.distributed.ReduceOp.SUM)
-                torch.distributed.all_reduce(batch_episode_reward_max, op=torch.distributed.ReduceOp.MAX)
+                    self.alg.process_env_step(obs, rewards, dones, extras)
 
-            batch_episode_count_f = float(batch_episode_count.item())
-            if batch_episode_count_f > 0:
-                max_batch_total_reward = float(batch_episode_reward_max.item())
-                mean_batch_total_reward = float((batch_episode_reward_sum / batch_episode_count_f).item())
-                regret = float(max_batch_total_reward - mean_batch_total_reward)
+                    if self.log_dir is not None:
+                        if "episode" in extras:
+                            ep_infos.append(extras["episode"])
+                        elif "log" in extras:
+                            ep_infos.append(extras["log"])
+
+                    done_ids = (dones > 0).nonzero(as_tuple=False)
+                    cur_reward_sum += rewards
+                    cur_episode_length += 1
+
+                if done_ids.numel() > 0:
+                    done_env_indices = done_ids[:, 0]
+                    ep_returns = cur_reward_sum[done_ids][:, 0]
+
+                    done_env_list = done_env_indices.cpu().numpy().tolist()
+                    ep_returns_list = ep_returns.cpu().numpy().tolist()
+                    for env_idx, ret in zip(done_env_list, ep_returns_list):
+                        per_slot_returns[env_idx].append(ret)
+
+                    if self.log_dir is not None:
+                        rewbuffer.extend(ep_returns_list)
+                        lenbuffer.extend(cur_episode_length[done_ids][:, 0].cpu().numpy().tolist())
+
+                    cur_reward_sum[done_ids] = 0
+                    cur_episode_length[done_ids] = 0
+
+            collection_time = time.time() - collection_start
+
+            # ── Protagonist PPO update (stock OnPolicyRunner shape) ──
+            learn_start = time.time()
+            with torch.inference_mode():
+                self.alg.compute_returns(obs)
+            loss_dict = self.alg.update()
+
+            # ── Adversary credit: per slot, exactly once per cycle when it crosses K ──
+            adv_loss_dict_mean = last_adv_loss_dict_mean
+            slot_ids_to_credit = [
+                i for i in range(self.env.num_envs)
+                if not slot_credited[i] and len(per_slot_returns[i]) >= regret_k
+            ]
+
+            # MIN-sync the "any credits this iter" decision across ranks so that
+            # distributed runs never have one rank enter the grad all_reduce path
+            # while another rank skips it.
+            if slot_ids_to_credit:
+                adv_tuples_full = self.state_buffer.get_adversary_tuples_for_envs()
+                local_ok = int(adv_tuples_full is not None)
             else:
+                adv_tuples_full = None
+                local_ok = 0
+            ok_t = torch.tensor(local_ok, dtype=torch.int, device=self.device)
+            if self.is_distributed:
+                torch.distributed.all_reduce(ok_t, op=torch.distributed.ReduceOp.MIN)
+
+            if ok_t.item():
+                regrets = []
+                for i in slot_ids_to_credit:
+                    first_k = per_slot_returns[i][:regret_k]
+                    regrets.append(max(first_k) - sum(first_k) / regret_k)
+                    slot_credited[i] = True
+
+                slot_idx_t = torch.tensor(slot_ids_to_credit, dtype=torch.long, device=self.device)
+                regret_t = torch.tensor(regrets, dtype=torch.float, device=self.device)
+
+                adv_tuples = self._select_adv_tuples(adv_tuples_full, slot_idx_t)
+                combined_rewards = (
+                    self.beta_gen_reward * adv_tuples["gen_reward"] + regret_t
+                ).unsqueeze(-1)
+
+                # Reinit SimplePPO storage to variable batch size n
+                self._prepare_adversary_storage(
+                    n=len(slot_ids_to_credit), obs_spec=adv_tuples["obs"]
+                )
+                adv_loss_dict = self._adversary_update_from_tuples(
+                    adv_tuples, combined_rewards, last_obs=obs,
+                )
+                adv_loss_dict_mean = adv_loss_dict
+                last_adv_loss_dict_mean = adv_loss_dict_mean
+                adv_rewbuffer.append(combined_rewards.mean().item())
+            # If ok_t is false (distributed: a peer rank had no credits), slots
+            # stay uncredited this iter and will retry next iter. The
+            # max_iters_per_cycle safety cap bounds the worst case.
+
+            # Populate batch regret stats for the logger
+            returns_flat = [r for slot in per_slot_returns for r in slot]
+            if returns_flat:
+                batch_episode_count = len(returns_flat)
+                max_batch_total_reward = float(max(returns_flat))
+                mean_batch_total_reward = float(sum(returns_flat) / batch_episode_count)
+                regret = max_batch_total_reward - mean_batch_total_reward
+            else:
+                batch_episode_count = 0
                 max_batch_total_reward = 0.0
                 mean_batch_total_reward = 0.0
                 regret = 0.0
-            batch_episode_count = batch_episode_count_f
 
-            stop = time.time()
-            collection_time = stop - start
-            start = stop
-
-            # ── Update adversary ─────────────────────────────────────────
-            # Use the (obs, action, log_prob, mu, sigma, gen_reward) tuple captured
-            # in Phase A — the SAME action that produced each env's reset state —
-            # plus regret from Phase B for that env. This is the algorithm:
-            #
-            #   adversary_reward[i] = gen_reward[i] + regret[i]
-            #
-            # where slot[i] = the buffer slot env i was reset from (via _per_env_slot).
-            adv_loss_dict_mean = None
-            per_env_episode_counts = [len(r) for r in per_env_episode_returns]
-            min_episodes_per_env = min(per_env_episode_counts)
-            max_episodes_per_env = max(per_env_episode_counts)
-            mean_episodes_per_env = sum(per_env_episode_counts) / max(len(per_env_episode_counts), 1)
-            envs_with_episodes = sum(1 for c in per_env_episode_counts if c > 0)
-            print(
-                f"[PhaseB gate] per-env episodes: min={min_episodes_per_env}, "
-                f"max={max_episodes_per_env}, mean={mean_episodes_per_env:.2f}, "
-                f"envs_with_eps={envs_with_episodes}/{self.env.num_envs}, "
-                f"threshold={adversary_update_every_n_episodes}, "
-                f"fires={min_episodes_per_env >= adversary_update_every_n_episodes}"
-            )
-            if min_episodes_per_env >= adversary_update_every_n_episodes:
-                per_env_regret = []
-                for env_idx in range(self.env.num_envs):
-                    rewards_i = per_env_episode_returns[env_idx]
-                    if len(rewards_i) > 0:
-                        per_env_regret.append(max(rewards_i) - sum(rewards_i) / len(rewards_i))
-                    else:
-                        per_env_regret.append(0.0)
-
-                regret_t = torch.tensor(per_env_regret, dtype=torch.float, device=self.device)
-
-                # Read-only diagnostic: is the current clear-and-regenerate policy
-                # throwing away high-regret slots? Logs only, no behavior change.
-                if self.log_dir is not None and not self.disable_logs:
-                    self._log_buffer_diagnostics(per_env_episode_returns, it)
-
-                adv_tuples = self.state_buffer.get_adversary_tuples_for_envs()
-                # Sync the decision across ranks via MIN(local_ready): only run
-                # the update if EVERY rank has tuples, else all ranks skip
-                # together so no rank hangs alone on the grad all_reduce.
-                ready_t = torch.tensor(
-                    int(adv_tuples is not None), dtype=torch.int, device=self.device
-                )
-                if self.is_distributed:
-                    torch.distributed.all_reduce(ready_t, op=torch.distributed.ReduceOp.MIN)
-
-                if not ready_t.item():
-                    print(
-                        f"[rank {self.gpu_global_rank}] Skipping adversary update "
-                        f"(local_ready={adv_tuples is not None})."
-                    )
-                    adv_loss_dict_mean = last_adv_loss_dict_mean
-                else:
-                    combined_rewards = (self.beta_gen_reward * adv_tuples["gen_reward"] + regret_t).unsqueeze(-1)
-                    adv_mean_reward = combined_rewards.mean().item()
-
-                    adv_loss_dict = self._adversary_update_from_tuples(
-                        adv_tuples, combined_rewards, last_obs=obs,
-                    )
-                    adv_loss_dict_mean = adv_loss_dict
-                    last_adv_loss_dict_mean = adv_loss_dict_mean
-                    adv_rewbuffer.append(adv_mean_reward)
-
-                per_env_episode_returns = [[] for _ in range(self.env.num_envs)]
+            # ── Cycle-end check: all slots credited → refill Phase A ──
+            # MIN-sync across ranks so all ranks refill together.
+            local_complete = int(all(slot_credited))
+            local_cap = int(iters_in_cycle >= max_iters_per_cycle)
+            if self.is_distributed:
+                cc_t = torch.tensor(local_complete, dtype=torch.int, device=self.device)
+                fc_t = torch.tensor(local_cap, dtype=torch.int, device=self.device)
+                torch.distributed.all_reduce(cc_t, op=torch.distributed.ReduceOp.MIN)
+                torch.distributed.all_reduce(fc_t, op=torch.distributed.ReduceOp.MAX)
+                cycle_complete = bool(cc_t.item())
+                force_refill = bool(fc_t.item())
             else:
-                adv_loss_dict_mean = last_adv_loss_dict_mean
+                cycle_complete = bool(local_complete)
+                force_refill = bool(local_cap)
 
-            stop = time.time()
-            learn_time = stop - start
+            if cycle_complete or force_refill:
+                if force_refill and not cycle_complete:
+                    leftover = [i for i in range(self.env.num_envs) if not slot_credited[i]]
+                    print(
+                        f"[cycle-cap] force-refilling after {iters_in_cycle} iters; "
+                        f"{len(leftover)}/{self.env.num_envs} slots uncredited"
+                    )
+
+                    # MIN-sync across ranks so all ranks either run the leftover
+                    # zero-regret credit (which fires grad all_reduce inside
+                    # _adversary_update_from_tuples) or all skip it together.
+                    if leftover:
+                        adv_tuples_full = self.state_buffer.get_adversary_tuples_for_envs()
+                        leftover_ok = int(adv_tuples_full is not None)
+                    else:
+                        adv_tuples_full = None
+                        leftover_ok = 0
+                    leftover_ok_t = torch.tensor(
+                        leftover_ok, dtype=torch.int, device=self.device
+                    )
+                    if self.is_distributed:
+                        torch.distributed.all_reduce(
+                            leftover_ok_t, op=torch.distributed.ReduceOp.MIN
+                        )
+
+                    if leftover_ok_t.item():
+                        leftover_t = torch.tensor(leftover, dtype=torch.long, device=self.device)
+                        zero_regret = torch.zeros(
+                            len(leftover), dtype=torch.float, device=self.device
+                        )
+                        adv_tuples = self._select_adv_tuples(adv_tuples_full, leftover_t)
+                        combined_rewards = (
+                            self.beta_gen_reward * adv_tuples["gen_reward"] + zero_regret
+                        ).unsqueeze(-1)
+                        self._prepare_adversary_storage(
+                            n=len(leftover), obs_spec=adv_tuples["obs"]
+                        )
+                        self._adversary_update_from_tuples(
+                            adv_tuples, combined_rewards, last_obs=obs,
+                        )
+
+                # Refill with the *current* (just-updated) adversary policy
+                obs, gen_stats, generation_time = self._run_phase_a_refill(obs)
+                cur_reward_sum.zero_()
+                cur_episode_length.zero_()
+                per_slot_returns = [[] for _ in range(self.env.num_envs)]
+                slot_credited = [False] * self.env.num_envs
+                num_cycles_completed += 1
+                iters_in_cycle = 0
+
+            learn_time = time.time() - learn_start
             self.current_learning_iteration = it
 
             # ── Logging ──────────────────────────────────────────────────
@@ -446,7 +498,8 @@ class MultiAgentRunner:
                     locs=locals(),
                 )
 
-                self._log_generation_metrics(gen_stats, it)
+                if gen_stats is not None:
+                    self._log_generation_metrics(gen_stats, it)
 
                 if it % self.save_interval == 0:
                     self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
