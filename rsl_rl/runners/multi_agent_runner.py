@@ -18,7 +18,7 @@ from rsl_rl.algorithms.simple_ppo import SimplePPO
 from rsl_rl.env import VecEnv
 from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, AsymmetricActorCritic, resolve_symmetry_config
 from rsl_rl.utils import resolve_obs_groups, store_code_state
-from rsl_rl.utils.logger import log_multi_agent
+from rsl_rl.utils.logger import log_phase_a, log_phase_b
 from rsl_rl.storage.reset_state_buffer import ResetStateBuffer
 
 
@@ -275,7 +275,6 @@ class MultiAgentRunner:
         lenbuffer = deque(maxlen=100)
         cur_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
         cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
-        adv_rewbuffer = deque(maxlen=100)
 
         if self.is_distributed:
             self.alg.broadcast_parameters()
@@ -283,7 +282,21 @@ class MultiAgentRunner:
 
         start_iter = self.current_learning_iteration
         tot_iter = start_iter + num_learning_iterations
-        last_adv_loss_dict_mean: dict[str, float] | None = None
+
+        # Phase A accumulators. Reset at every refill. Normal-credit and
+        # force-refill-leftover adversary updates both fold into these so
+        # log_phase_a averages values across all updates that fired in the cycle.
+        # Reward is split three ways so Tensorboard shows the decomposition:
+        #   total  = beta * gen_reward + regret   (what PPO actually trains on)
+        #   gen    = gen_reward                   (raw validity/shaping signal)
+        #   regret = max(returns) - mean(returns) (protagonist-weakness signal;
+        #                                          forced to 0 on leftover credit)
+        cycle_adv_loss_sums: dict[str, float] = {}
+        cycle_adv_loss_count: int = 0
+        cycle_adv_total_rewards: list[float] = []
+        cycle_adv_gen_rewards: list[float] = []
+        cycle_adv_regrets: list[float] = []
+        cycle_id: int = 0
 
         # K-episode cycle: Phase A refills buffer at cycle end, PPO runs stock
         # OnPolicyRunner iterations with sticky pinning, each slot is credited
@@ -299,13 +312,30 @@ class MultiAgentRunner:
             (self.env.num_envs, self.adversary_action_dim), device=self.device
         )
 
-        # Bootstrap: one Phase A refill before the first iteration
+        # Bootstrap: one Phase A refill before the first iteration. Logged as
+        # cycle_id=0 on the Phase A axis; no buffer diagnostics (no protagonist
+        # returns yet) and no adversary losses (no updates have fired).
         obs, _gen_stats_initial, _ = self._run_phase_a_refill(obs)
         cur_reward_sum.zero_()
         cur_episode_length.zero_()
 
+        if self.log_dir is not None and not self.disable_logs:
+            log_phase_a(
+                writer=self.writer,
+                alg_adversary=self.alg_adversary,
+                cycle_id=cycle_id,
+                step=start_iter,
+                gen_stats=_gen_stats_initial,
+                buffer_diag=None,
+                cycle_adv_loss_sums={},
+                cycle_adv_loss_count=0,
+                cycle_adv_total_rewards=[],
+                cycle_adv_gen_rewards=[],
+                cycle_adv_regrets=[],
+            )
+        cycle_id += 1
+
         per_slot_returns: list[list[float]] = [[] for _ in range(self.env.num_envs)]
-        slot_credited: list[bool] = [False] * self.env.num_envs
         # After every Phase A refill we randomize `episode_length_buf` to
         # desynchronize episode endings. The first `done` event per env
         # post-refill is therefore a truncated remnant, not a representative
@@ -379,55 +409,6 @@ class MultiAgentRunner:
                 self.alg.compute_returns(obs)
             loss_dict = self.alg.update()
 
-            # ── Adversary credit: per slot, exactly once per cycle when it crosses K ──
-            adv_loss_dict_mean = last_adv_loss_dict_mean
-            slot_ids_to_credit = [
-                i for i in range(self.env.num_envs)
-                if not slot_credited[i] and len(per_slot_returns[i]) >= regret_k
-            ]
-
-            # MIN-sync the "any credits this iter" decision across ranks so that
-            # distributed runs never have one rank enter the grad all_reduce path
-            # while another rank skips it.
-            if slot_ids_to_credit:
-                adv_tuples_full = self.state_buffer.get_adversary_tuples_for_envs()
-                local_ok = int(adv_tuples_full is not None)
-            else:
-                adv_tuples_full = None
-                local_ok = 0
-            ok_t = torch.tensor(local_ok, dtype=torch.int, device=self.device)
-            if self.is_distributed:
-                torch.distributed.all_reduce(ok_t, op=torch.distributed.ReduceOp.MIN)
-
-            if ok_t.item():
-                regrets = []
-                for i in slot_ids_to_credit:
-                    first_k = per_slot_returns[i][:regret_k]
-                    regrets.append(max(first_k) - sum(first_k) / regret_k)
-                    slot_credited[i] = True
-
-                slot_idx_t = torch.tensor(slot_ids_to_credit, dtype=torch.long, device=self.device)
-                regret_t = torch.tensor(regrets, dtype=torch.float, device=self.device)
-
-                adv_tuples = self._select_adv_tuples(adv_tuples_full, slot_idx_t)
-                combined_rewards = (
-                    self.beta_gen_reward * adv_tuples["gen_reward"] + regret_t
-                ).unsqueeze(-1)
-
-                # Reinit SimplePPO storage to variable batch size n
-                self._prepare_adversary_storage(
-                    n=len(slot_ids_to_credit), obs_spec=adv_tuples["obs"]
-                )
-                adv_loss_dict = self._adversary_update_from_tuples(
-                    adv_tuples, combined_rewards, last_obs=obs,
-                )
-                adv_loss_dict_mean = adv_loss_dict
-                last_adv_loss_dict_mean = adv_loss_dict_mean
-                adv_rewbuffer.append(combined_rewards.mean().item())
-            # If ok_t is false (distributed: a peer rank had no credits), slots
-            # stay uncredited this iter and will retry next iter. The
-            # max_iters_per_cycle safety cap bounds the worst case.
-
             # Populate batch regret stats for the logger
             returns_flat = [r for slot in per_slot_returns for r in slot]
             if returns_flat:
@@ -441,9 +422,9 @@ class MultiAgentRunner:
                 mean_batch_total_reward = 0.0
                 regret = 0.0
 
-            # ── Cycle-end check: all slots credited → refill Phase A ──
+            # ── Cycle-end check: all slots have >= regret_k episodes → refill Phase A ──
             # MIN-sync across ranks so all ranks refill together.
-            local_complete = int(all(slot_credited))
+            local_complete = int(all(len(s) >= regret_k for s in per_slot_returns))
             local_cap = int(iters_in_cycle >= max_iters_per_cycle)
             if self.is_distributed:
                 cc_t = torch.tensor(local_complete, dtype=torch.int, device=self.device)
@@ -457,47 +438,27 @@ class MultiAgentRunner:
                 force_refill = bool(local_cap)
 
             if cycle_complete or force_refill:
+                # Per-slot regret: use max-mean of the first K returns if the
+                # slot banked K episodes, else 0. Zero-regret slots (crashes,
+                # starved rollouts) still contribute their gen_reward signal
+                # so the adversary learns those states are bad sampling targets.
+                regrets: list[float] = []
+                zero_regret_count = 0
+                for i in range(self.env.num_envs):
+                    slot = per_slot_returns[i]
+                    if len(slot) >= regret_k:
+                        first_k = slot[:regret_k]
+                        regrets.append(max(first_k) - sum(first_k) / regret_k)
+                    else:
+                        regrets.append(0.0)
+                        zero_regret_count += 1
+
                 if force_refill and not cycle_complete:
-                    leftover = [i for i in range(self.env.num_envs) if not slot_credited[i]]
                     print(
                         f"[cycle-cap] force-refilling after {iters_in_cycle} iters; "
-                        f"{len(leftover)}/{self.env.num_envs} slots uncredited"
+                        f"{zero_regret_count}/{self.env.num_envs} slots had zero regret"
                     )
-
-                    # MIN-sync across ranks so all ranks either run the leftover
-                    # zero-regret credit (which fires grad all_reduce inside
-                    # _adversary_update_from_tuples) or all skip it together.
-                    if leftover:
-                        adv_tuples_full = self.state_buffer.get_adversary_tuples_for_envs()
-                        leftover_ok = int(adv_tuples_full is not None)
-                    else:
-                        adv_tuples_full = None
-                        leftover_ok = 0
-                    leftover_ok_t = torch.tensor(
-                        leftover_ok, dtype=torch.int, device=self.device
-                    )
-                    if self.is_distributed:
-                        torch.distributed.all_reduce(
-                            leftover_ok_t, op=torch.distributed.ReduceOp.MIN
-                        )
-
-                    if leftover_ok_t.item():
-                        leftover_t = torch.tensor(leftover, dtype=torch.long, device=self.device)
-                        zero_regret = torch.zeros(
-                            len(leftover), dtype=torch.float, device=self.device
-                        )
-                        adv_tuples = self._select_adv_tuples(adv_tuples_full, leftover_t)
-                        combined_rewards = (
-                            self.beta_gen_reward * adv_tuples["gen_reward"] + zero_regret
-                        ).unsqueeze(-1)
-                        self._prepare_adversary_storage(
-                            n=len(leftover), obs_spec=adv_tuples["obs"]
-                        )
-                        self._adversary_update_from_tuples(
-                            adv_tuples, combined_rewards, last_obs=obs,
-                        )
-
-                if cycle_complete and not force_refill:
+                else:
                     total_eps = sum(len(s) for s in per_slot_returns)
                     print(
                         f"[cycle-complete] iter={it} cycle={num_cycles_completed} "
@@ -505,18 +466,72 @@ class MultiAgentRunner:
                         f"total_episodes={total_eps} → refilling Phase A"
                     )
 
-                # Log per-slot regret distribution before discarding the buffer.
-                # Key metric: kept_top50_over_mean ≥ 1.5 means high-regret slots
-                # are being wasted → consider selective refill instead of full clear.
-                if self.log_dir is not None and not self.disable_logs:
-                    self._log_buffer_diagnostics(per_slot_returns, it)
+                # MIN-sync across ranks so all ranks either run the full-batch
+                # update (which fires grad all_reduce inside
+                # _adversary_update_from_tuples) or all skip it together.
+                adv_tuples_full = self.state_buffer.get_adversary_tuples_for_envs()
+                local_ok = int(adv_tuples_full is not None)
+                ok_t = torch.tensor(local_ok, dtype=torch.int, device=self.device)
+                if self.is_distributed:
+                    torch.distributed.all_reduce(ok_t, op=torch.distributed.ReduceOp.MIN)
+
+                if ok_t.item():
+                    all_idx_t = torch.arange(
+                        self.env.num_envs, dtype=torch.long, device=self.device
+                    )
+                    regret_t = torch.tensor(regrets, dtype=torch.float, device=self.device)
+                    adv_tuples = self._select_adv_tuples(adv_tuples_full, all_idx_t)
+                    combined_rewards = (
+                        self.beta_gen_reward * adv_tuples["gen_reward"] + regret_t
+                    ).unsqueeze(-1)
+                    self._prepare_adversary_storage(
+                        n=self.env.num_envs, obs_spec=adv_tuples["obs"]
+                    )
+                    adv_loss_dict = self._adversary_update_from_tuples(
+                        adv_tuples, combined_rewards, last_obs=obs,
+                    )
+                    for k, v in adv_loss_dict.items():
+                        cycle_adv_loss_sums[k] = cycle_adv_loss_sums.get(k, 0.0) + float(v)
+                    cycle_adv_loss_count += 1
+                    cycle_adv_total_rewards.append(combined_rewards.mean().item())
+                    cycle_adv_gen_rewards.append(adv_tuples["gen_reward"].mean().item())
+                    cycle_adv_regrets.append(regret_t.mean().item())
+
+                # Snapshot per-slot regret distribution before discarding the
+                # buffer. Pure computation; log_phase_a emits the scalars on
+                # the cycle_id axis below. Key metric: kept_top50_over_mean
+                # ≥ 1.5 means high-regret slots are being wasted.
+                buffer_diag = self._compute_buffer_diagnostics(per_slot_returns)
 
                 # Refill with the *current* (just-updated) adversary policy
                 obs, gen_stats, generation_time = self._run_phase_a_refill(obs)
+
+                if self.log_dir is not None and not self.disable_logs:
+                    log_phase_a(
+                        writer=self.writer,
+                        alg_adversary=self.alg_adversary,
+                        cycle_id=cycle_id,
+                        step=it,
+                        gen_stats=gen_stats,
+                        buffer_diag=buffer_diag,
+                        cycle_adv_loss_sums=cycle_adv_loss_sums,
+                        cycle_adv_loss_count=cycle_adv_loss_count,
+                        cycle_adv_total_rewards=cycle_adv_total_rewards,
+                        cycle_adv_gen_rewards=cycle_adv_gen_rewards,
+                        cycle_adv_regrets=cycle_adv_regrets,
+                    )
+
+                # Reset Phase A accumulators now that log_phase_a consumed them.
+                cycle_adv_loss_sums = {}
+                cycle_adv_loss_count = 0
+                cycle_adv_total_rewards = []
+                cycle_adv_gen_rewards = []
+                cycle_adv_regrets = []
+                cycle_id += 1
+
                 cur_reward_sum.zero_()
                 cur_episode_length.zero_()
                 per_slot_returns = [[] for _ in range(self.env.num_envs)]
-                slot_credited = [False] * self.env.num_envs
                 first_post_refill = [True] * self.env.num_envs
                 num_cycles_completed += 1
                 iters_in_cycle = 0
@@ -524,28 +539,24 @@ class MultiAgentRunner:
             learn_time = time.time() - learn_start
             self.current_learning_iteration = it
 
-            # ── Logging ──────────────────────────────────────────────────
+            # ── Phase B logging (protagonist only, every iter, `it` axis) ──
             if self.log_dir is not None and not self.disable_logs:
                 collection_size = self.num_steps_per_env * self.env.num_envs * self.gpu_world_size
                 self.tot_timesteps += collection_size
                 self.tot_time += collection_time + learn_time
 
-                log_multi_agent(
+                log_phase_b(
                     writer=self.writer,
                     device=self.device,
                     num_steps_per_env=self.num_steps_per_env,
                     num_envs=self.env.num_envs,
                     gpu_world_size=self.gpu_world_size,
                     alg=self.alg,
-                    alg_adversary=self.alg_adversary,
                     logger_type=self.logger_type,
                     tot_timesteps=self.tot_timesteps,
                     tot_time=self.tot_time,
                     locs=locals(),
                 )
-
-                if gen_stats is not None:
-                    self._log_generation_metrics(gen_stats, it)
 
                 if it % self.save_interval == 0:
                     self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
@@ -663,6 +674,8 @@ class MultiAgentRunner:
         reward_term_names = reward_mgr.active_terms
         per_term_success_means = (per_term_success_total / max(success_count, 1)).cpu().tolist()
 
+        buffer_fill_pct = 100 * self.state_buffer.occupancy / max(self.state_buffer.capacity, 1)
+
         return {
             "final_obs": obs,
             "total_steps": total_steps,
@@ -675,36 +688,27 @@ class MultiAgentRunner:
             "collected_rewards": all_rewards,
             "reward_term_names": reward_term_names,
             "reward_term_success_means": per_term_success_means,
+            "buffer_fill_pct": buffer_fill_pct,
         }
 
-    def _log_generation_metrics(self, gen_stats: dict, it: int) -> None:
-        """Log generation-phase metrics to writer."""
-        self.writer.add_scalar("Generator/validity_rate", gen_stats["mean_validity_rate"], it)
-        self.writer.add_scalar("Generator/mean_reward", gen_stats["mean_reward"], it)
-        self.writer.add_scalar("Generator/state_quality", gen_stats["mean_state_quality"], it)
-        self.writer.add_scalar("Generator/num_successes", gen_stats["num_successes"], it)
-        self.writer.add_scalar("Generator/num_episodes_done", gen_stats["num_episodes_done"], it)
-        self.writer.add_scalar("Generator/buffer_fill_pct",
-            100 * self.state_buffer.occupancy / max(self.state_buffer.capacity, 1), it)
-
-        for tname, tval_suc in zip(
-            gen_stats["reward_term_names"],
-            gen_stats["reward_term_success_means"],
-        ):
-            self.writer.add_scalar(f"Generator_Reward_Success/{tname}", tval_suc, it)
-
     # =====================================================================
-    # Buffer diagnostics (read-only — no behavior change)
+    # Buffer diagnostics (pure computation — writer calls live in log_phase_a)
     # =====================================================================
 
-    def _log_buffer_diagnostics(
-        self, per_env_episode_returns: list[list[float]], it: int
-    ) -> None:
-        """Log per-slot regret distribution before a Phase A refill."""
+    def _compute_buffer_diagnostics(
+        self, per_env_episode_returns: list[list[float]]
+    ) -> dict | None:
+        """Compute per-slot regret distribution before a Phase A refill.
+
+        Returns a dict of scalars consumed by ``log_phase_a`` (which emits them
+        on the cycle_id axis), or None when no slot accumulated any returns.
+        The ``[BufferDiag]`` console line is printed here since it's a
+        cycle-boundary diagnostic, not a logger-scoped scalar.
+        """
         returns_with_data = [r for r in per_env_episode_returns if len(r) > 0]
         n = len(returns_with_data)
         if n == 0:
-            return
+            return None
 
         max_t = torch.tensor([max(r) for r in returns_with_data], dtype=torch.float, device=self.device)
         mean_t = torch.tensor(
@@ -720,16 +724,17 @@ class MultiAgentRunner:
         kept_top50 = torch.topk(regret_t, k, largest=True).values.mean().item()
         kept_top50_over_mean = kept_top50 / max(regret_mean, 1e-8)
 
-        w = self.writer
-        w.add_scalar("BufferDiag/regret_mean", regret_mean, it)
-        w.add_scalar("BufferDiag/regret_p90", regret_p90, it)
-        w.add_scalar("BufferDiag/regret_max", regret_max, it)
-        w.add_scalar("BufferDiag/kept_top50_over_mean", kept_top50_over_mean, it)
-
         print(
             f"[BufferDiag] regret: mean={regret_mean:.3f} p90={regret_p90:.3f} "
             f"max={regret_max:.3f} | kept_top50/mean={kept_top50_over_mean:.3f}"
         )
+
+        return {
+            "regret_mean": regret_mean,
+            "regret_p90": regret_p90,
+            "regret_max": regret_max,
+            "kept_top50_over_mean": kept_top50_over_mean,
+        }
 
     # =====================================================================
     # Save / load
