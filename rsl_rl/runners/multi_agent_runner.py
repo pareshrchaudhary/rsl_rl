@@ -17,15 +17,10 @@ from rsl_rl.algorithms import PPO
 from rsl_rl.algorithms.simple_ppo import SimplePPO
 from rsl_rl.env import VecEnv
 from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, AsymmetricActorCritic, resolve_symmetry_config
+from rsl_rl.runners.eval_runner import EvalRunner
 from rsl_rl.utils import resolve_obs_groups, store_code_state
 from rsl_rl.utils.logger import log_phase_a, log_phase_b
 from rsl_rl.storage.reset_state_buffer import ResetStateBuffer
-
-
-# Buffer diagnostics: a slot's episode return > SOLVED_THRESHOLD is treated as solved.
-# success_reward fires at 1.0 on assembly, so 0.5 is a safe conservative cut.
-SOLVED_THRESHOLD = 0.5
-
 
 class MultiAgentRunner:
     """Alternates adversary generation (2s settling) and policy training (16s) phases."""
@@ -42,10 +37,8 @@ class MultiAgentRunner:
         self.device = device
         self.env = env
 
-        # Multi-GPU setup
         self._configure_multi_gpu()
 
-        # Training configuration
         self.num_steps_per_env = self.cfg["num_steps_per_env"]
         self.save_interval = self.cfg["save_interval"]
 
@@ -53,10 +46,8 @@ class MultiAgentRunner:
         self.adversary_action_dim = self.cfg["adversary_robot_parameters"]
         self.policy_action_dim = int(self.env.num_actions - self.adversary_action_dim)
 
-        # Query observations from environment for algorithm construction
         obs = self.env.get_observations()
 
-        # Resolve observation group mappings per agent.
         self.cfg["obs_groups"] = resolve_obs_groups(obs, dict(self.obs_groups_raw), ["critic"])
 
         adversary_obs_groups_raw = dict(self.adversary_obs_groups_raw)
@@ -64,7 +55,7 @@ class MultiAgentRunner:
             adversary_obs_groups_raw["critic"] = list(adversary_obs_groups_raw.get("policy", []))
         self.adversary_obs_groups = resolve_obs_groups(obs, adversary_obs_groups_raw, ["critic"])
 
-        # Create the algorithms (IPPO).
+        # IPPO: independent PPO per agent.
         self.alg = self._construct_agent_algorithm(
             obs=obs,
             obs_groups=self.cfg["obs_groups"],
@@ -82,10 +73,8 @@ class MultiAgentRunner:
             storage_horizon=1,
         )
 
-        # Only log from rank 0
         self.disable_logs = self.is_distributed and self.gpu_global_rank != 0
 
-        # Logging
         self.log_dir = log_dir
         self.writer = None
         self.tot_timesteps = 0
@@ -93,27 +82,25 @@ class MultiAgentRunner:
         self.current_learning_iteration = 0
         self.git_status_repos: list[str] = [str(rsl_rl.__file__)]
 
-        # Physics-validation-specific config.
-        # The env is created with its TRAINING episode length as natural state — we
-        # snapshot it here and restore it for Phase B. Phase A temporarily overrides
-        # episode_length_s to the (shorter) generation length specified in runner cfg.
+        # Env is created with the training episode length; snapshot it and swap to
+        # generation_episode_length_s only during Phase A.
         self.generation_max_steps = self.cfg.get("generation_max_steps", 1000)
         self.training_episode_length_s = self.env.unwrapped.cfg.episode_length_s
         self.generation_episode_length_s = self.cfg.get("generation_episode_length_s", 2.0)
-        # Scale on gen_reward contribution to adversary reward. 0 disables the
-        # validity/geometry shaping entirely, leaving regret as the sole signal.
+        # 0 disables validity/geometry shaping, leaving regret as the sole signal.
         self.beta_gen_reward = float(self.cfg.get("beta_gen_reward", 1.0))
 
         self.state_buffer = ResetStateBuffer(
             capacity=self.env.num_envs, device=self.device, num_envs=self.env.num_envs
         )
 
-        # Cache success termination index (resolved lazily)
         self._success_term_idx: int | None = None
 
         print(f"[MultiAgentRunner] num_envs={self.env.num_envs}, "
               f"gen={self.generation_episode_length_s}s/{self.generation_max_steps}steps, "
               f"train={self.training_episode_length_s}s")
+
+        self.eval_runner = EvalRunner(self)
 
     # =====================================================================
     # Adversary sampling + manual transition population
@@ -122,22 +109,16 @@ class MultiAgentRunner:
     def _sample_adversary_capture(
         self, obs, env_indices: torch.Tensor | None = None
     ) -> torch.Tensor:
-        """Sample stochastic adversary actions and capture (obs, action, log_prob, mu, sigma)
-        into per-env scratch tensors for later push into the buffer.
-
-        Calls ``policy.act`` (stochastic), not ``act_inference`` — we need real samples
-        with their log-probs so PPO's ratio is honest at update time.
-
-        If ``env_indices`` is None, snapshots for all envs (used at the start of Phase A
-        when every env has just been reset). Otherwise updates only those envs.
-        Returns the per-env action tensor (sampled for all envs).
+        """Sample stochastic adversary actions and snapshot (obs, action, log_prob, mu, sigma)
+        into scratch tensors. Uses ``policy.act`` (not ``act_inference``) so PPO's ratio is
+        honest at update time. ``env_indices=None`` snapshots all envs; otherwise only those.
         """
         with torch.inference_mode():
             action = self.alg_adversary.policy.act(obs).detach()
             log_prob = self.alg_adversary.policy.get_actions_log_prob(action).detach()
             mu = self.alg_adversary.policy.action_mean.detach().clone()
             sigma_raw = self.alg_adversary.policy.action_std.detach()
-            # Normalize sigma to (num_envs, action_dim) — may be (action_dim,) for shared std
+            # Broadcast shared-std case (action_dim,) to (num_envs, action_dim).
             if sigma_raw.dim() == 1:
                 sigma = sigma_raw.unsqueeze(0).expand(self.env.num_envs, -1).clone()
             else:
@@ -163,11 +144,8 @@ class MultiAgentRunner:
     def _adversary_update_from_tuples(
         self, tuples: dict, rewards: torch.Tensor, last_obs
     ) -> dict:
-        """Run a SimplePPO update using pre-captured (obs, action, log_prob, mu, sigma) tuples.
-
-        Bypasses ``alg_adversary.act()`` so the log-prob/mu/sigma stored at action-time
-        in Phase A are used directly. ``rewards`` is the per-env total reward to credit
-        the stored action with (gen_reward + regret).
+        """SimplePPO update using pre-captured tuples from Phase A, bypassing ``alg_adversary.act()``
+        so the log_prob/mu/sigma stored at action-time are used directly.
         """
         alg = self.alg_adversary
         n = tuples["action"].shape[0]
@@ -202,17 +180,14 @@ class MultiAgentRunner:
     # =====================================================================
 
     def _run_phase_a_refill(self, obs):
-        """Run Phase A, refill buffer, re-pin envs. Returns (obs, gen_stats, generation_time).
+        """Run Phase A, refill buffer, re-attach for async Phase B pulls. Returns (obs, gen_stats).
 
-        After the force-reset, randomize ``episode_length_buf`` so env episodes
-        truncate at different times in the first rollouts of the new cycle.
-        Without this desynchronization, all envs finish their first full episode
-        in the same rollout window and per-iter metrics become very spiky
-        (alternating between ~0 and ~num_envs episode completions). Stock
-        ``OnPolicyRunner`` does the same thing at learn-start via
-        ``init_at_random_ep_len=True``; we need it at every Phase A refill too.
+        No synchronized reset at the boundary — envs transition to buffer states
+        organically via the natural auto-reset path (``reset_from_state_buffer``
+        event term fires inside ``env.step`` when each env's leftover Phase A
+        episode ends). This avoids the sync burst that synchronized resets
+        produce and matches OmniReset's async reset pattern.
         """
-        gen_start = time.time()
         self.env.unwrapped.cfg.episode_length_s = self.generation_episode_length_s
         self.env.unwrapped.reset_state_buffer = None
 
@@ -223,19 +198,9 @@ class MultiAgentRunner:
         self.env.unwrapped.reset_state_buffer = self.state_buffer
         self.state_buffer.reset_per_env_tracking()
 
-        with torch.inference_mode():
-            all_env_ids = torch.arange(self.env.num_envs, device=self.device)
-            self.env.unwrapped._reset_idx(all_env_ids)
-            # Desynchronize episode timing across envs for smooth per-iter metrics.
-            self.env.episode_length_buf = torch.randint_like(
-                self.env.episode_length_buf, high=int(self.env.max_episode_length)
-            )
-            obs = self.env.get_observations().to(self.device)
-
-        return obs, gen_stats, time.time() - gen_start
+        return obs, gen_stats
 
     def _prepare_adversary_storage(self, n: int, obs_spec) -> None:
-        """Reinit alg_adversary.storage for a variable-width batch of size n (horizon=1)."""
         self.alg_adversary.init_storage(
             "rl",
             num_envs=n,
@@ -245,7 +210,6 @@ class MultiAgentRunner:
         )
 
     def _select_adv_tuples(self, adv_tuples_full: dict, idx_t: torch.Tensor) -> dict:
-        """Slice a full per-env adversary-tuple dict to just the given slot indices."""
         return {
             "obs":        {k: v[idx_t].clone() for k, v in adv_tuples_full["obs"].items()},
             "action":     adv_tuples_full["action"][idx_t].clone(),
@@ -282,15 +246,6 @@ class MultiAgentRunner:
 
         start_iter = self.current_learning_iteration
         tot_iter = start_iter + num_learning_iterations
-
-        # Phase A accumulators. Reset at every refill. Normal-credit and
-        # force-refill-leftover adversary updates both fold into these so
-        # log_phase_a averages values across all updates that fired in the cycle.
-        # Reward is split three ways so Tensorboard shows the decomposition:
-        #   total  = beta * gen_reward + regret   (what PPO actually trains on)
-        #   gen    = gen_reward                   (raw validity/shaping signal)
-        #   regret = max(returns) - mean(returns) (protagonist-weakness signal;
-        #                                          forced to 0 on leftover credit)
         cycle_adv_loss_sums: dict[str, float] = {}
         cycle_adv_loss_count: int = 0
         cycle_adv_total_rewards: list[float] = []
@@ -298,24 +253,16 @@ class MultiAgentRunner:
         cycle_adv_regrets: list[float] = []
         cycle_id: int = 0
 
-        # K-episode cycle: Phase A refills buffer at cycle end, PPO runs stock
-        # OnPolicyRunner iterations with sticky pinning, each slot is credited
-        # to the adversary exactly once when it banks `regret_k` episodes.
         regret_k = int(self.cfg.get("regret_k", 3))
         max_iters_per_cycle = int(self.cfg.get("max_iters_per_cycle", 50))
 
-        # Phase B adversary slice is inert: the only reset event that fires
-        # is the buffer reset (which ignores raw_actions), no obs term reads
-        # the adversary action, and no reward term references it. Feed zeros
-        # just to satisfy the env's action-width expectation.
+        # Phase B adversary slice is inert (no obs/reward term reads it, buffer
+        # reset ignores raw_actions) — zeros just satisfy action-width.
         phase_b_adversary_actions = torch.zeros(
             (self.env.num_envs, self.adversary_action_dim), device=self.device
         )
 
-        # Bootstrap: one Phase A refill before the first iteration. Logged as
-        # cycle_id=0 on the Phase A axis; no buffer diagnostics (no protagonist
-        # returns yet) and no adversary losses (no updates have fired).
-        obs, _gen_stats_initial, _ = self._run_phase_a_refill(obs)
+        obs, _gen_stats_initial = self._run_phase_a_refill(obs)
         cur_reward_sum.zero_()
         cur_episode_length.zero_()
 
@@ -336,20 +283,19 @@ class MultiAgentRunner:
         cycle_id += 1
 
         per_slot_returns: list[list[float]] = [[] for _ in range(self.env.num_envs)]
-        # After every Phase A refill we randomize `episode_length_buf` to
-        # desynchronize episode endings. The first `done` event per env
-        # post-refill is therefore a truncated remnant, not a representative
-        # episode — drop it from metrics and adversary credit.
+        # First done per env post-refill is the leftover Phase A episode
+        # continuing into Phase B (the env hasn't yet pinned to a buffer slot).
+        # Drop it from metrics and adversary credit — only buffer-pinned
+        # episodes should count toward per-slot regret.
         first_post_refill: list[bool] = [True] * self.env.num_envs
         iters_in_cycle: int = 0
         num_cycles_completed: int = 0
 
         for it in range(start_iter, tot_iter):
             gen_stats = None
-            generation_time = 0.0
             iters_in_cycle += 1
 
-            # ── Phase B: stock OnPolicyRunner rollout ──
+            # Phase B: protagonist rollout.
             collection_start = time.time()
 
             for _ in range(self.num_steps_per_env):
@@ -362,7 +308,7 @@ class MultiAgentRunner:
 
                     self.alg.process_env_step(obs, rewards, dones, extras)
 
-                    if self.log_dir is not None:
+                    if self.log_dir is not None and dones.any():
                         if "episode" in extras:
                             ep_infos.append(extras["episode"])
                         elif "log" in extras:
@@ -381,9 +327,6 @@ class MultiAgentRunner:
                     ep_returns_list = ep_returns.cpu().numpy().tolist()
                     cur_lens_list = cur_lens.cpu().numpy().tolist()
 
-                    # Filter out each env's first post-refill episode: its
-                    # return is a truncated remnant from the randomized
-                    # episode_length_buf desync, not a representative episode.
                     counted_rets: list[float] = []
                     counted_lens: list[float] = []
                     for env_idx, ret, ep_len in zip(done_env_list, ep_returns_list, cur_lens_list):
@@ -403,13 +346,11 @@ class MultiAgentRunner:
 
             collection_time = time.time() - collection_start
 
-            # ── Protagonist PPO update (stock OnPolicyRunner shape) ──
             learn_start = time.time()
             with torch.inference_mode():
                 self.alg.compute_returns(obs)
             loss_dict = self.alg.update()
 
-            # Populate batch regret stats for the logger
             returns_flat = [r for slot in per_slot_returns for r in slot]
             if returns_flat:
                 batch_episode_count = len(returns_flat)
@@ -422,8 +363,8 @@ class MultiAgentRunner:
                 mean_batch_total_reward = 0.0
                 regret = 0.0
 
-            # ── Cycle-end check: all slots have >= regret_k episodes → refill Phase A ──
-            # MIN-sync across ranks so all ranks refill together.
+            # Cycle ends when every slot has banked K episodes. MIN-sync across
+            # ranks so all refill together.
             local_complete = int(all(len(s) >= regret_k for s in per_slot_returns))
             local_cap = int(iters_in_cycle >= max_iters_per_cycle)
             if self.is_distributed:
@@ -438,10 +379,8 @@ class MultiAgentRunner:
                 force_refill = bool(local_cap)
 
             if cycle_complete or force_refill:
-                # Per-slot regret: use max-mean of the first K returns if the
-                # slot banked K episodes, else 0. Zero-regret slots (crashes,
-                # starved rollouts) still contribute their gen_reward signal
-                # so the adversary learns those states are bad sampling targets.
+                # Max-mean over first K returns when slot has K, else 0. Starved
+                # slots still train on gen_reward so they're marked as bad targets.
                 regrets: list[float] = []
                 zero_regret_count = 0
                 for i in range(self.env.num_envs):
@@ -466,9 +405,7 @@ class MultiAgentRunner:
                         f"total_episodes={total_eps} → refilling Phase A"
                     )
 
-                # MIN-sync across ranks so all ranks either run the full-batch
-                # update (which fires grad all_reduce inside
-                # _adversary_update_from_tuples) or all skip it together.
+                # MIN-sync so all ranks fire the grad all_reduce together (or skip it).
                 adv_tuples_full = self.state_buffer.get_adversary_tuples_for_envs()
                 local_ok = int(adv_tuples_full is not None)
                 ok_t = torch.tensor(local_ok, dtype=torch.int, device=self.device)
@@ -493,18 +430,15 @@ class MultiAgentRunner:
                     for k, v in adv_loss_dict.items():
                         cycle_adv_loss_sums[k] = cycle_adv_loss_sums.get(k, 0.0) + float(v)
                     cycle_adv_loss_count += 1
-                    cycle_adv_total_rewards.append(combined_rewards.mean().item())
-                    cycle_adv_gen_rewards.append(adv_tuples["gen_reward"].mean().item())
-                    cycle_adv_regrets.append(regret_t.mean().item())
+                    cycle_adv_total_rewards.extend(combined_rewards.squeeze(-1).tolist())
+                    cycle_adv_gen_rewards.extend(adv_tuples["gen_reward"].tolist())
+                    cycle_adv_regrets.extend(regret_t.tolist())
 
-                # Snapshot per-slot regret distribution before discarding the
-                # buffer. Pure computation; log_phase_a emits the scalars on
-                # the cycle_id axis below. Key metric: kept_top50_over_mean
-                # ≥ 1.5 means high-regret slots are being wasted.
+                # Snapshot regret distribution before the buffer is discarded.
                 buffer_diag = self._compute_buffer_diagnostics(per_slot_returns)
 
-                # Refill with the *current* (just-updated) adversary policy
-                obs, gen_stats, generation_time = self._run_phase_a_refill(obs)
+                # Refill with the just-updated adversary.
+                obs, gen_stats = self._run_phase_a_refill(obs)
 
                 if self.log_dir is not None and not self.disable_logs:
                     log_phase_a(
@@ -521,7 +455,6 @@ class MultiAgentRunner:
                         cycle_adv_regrets=cycle_adv_regrets,
                     )
 
-                # Reset Phase A accumulators now that log_phase_a consumed them.
                 cycle_adv_loss_sums = {}
                 cycle_adv_loss_count = 0
                 cycle_adv_total_rewards = []
@@ -539,7 +472,6 @@ class MultiAgentRunner:
             learn_time = time.time() - learn_start
             self.current_learning_iteration = it
 
-            # ── Phase B logging (protagonist only, every iter, `it` axis) ──
             if self.log_dir is not None and not self.disable_logs:
                 collection_size = self.num_steps_per_env * self.env.num_envs * self.gpu_world_size
                 self.tot_timesteps += collection_size
@@ -562,6 +494,7 @@ class MultiAgentRunner:
                     self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
 
             ep_infos.clear()
+            self.eval_runner.run(it)
             if it == start_iter and self.log_dir is not None and not self.disable_logs:
                 git_file_paths = store_code_state(self.log_dir, self.git_status_repos)
                 if self.logger_type in ["wandb", "neptune"] and git_file_paths:
@@ -578,10 +511,8 @@ class MultiAgentRunner:
     # =====================================================================
 
     def _run_generation_loop(self, obs) -> dict:
-        """Run adversary generation: noise -> adversary action -> physics settles ->
-        validity check. Successful (state, adv tuple, gen_reward) bundles are pushed
-        to the buffer; the adversary tuple captured here is later used to train the
-        adversary on the actual action it took.
+        """Adversary action → physics settles → validity check. Successful
+        (state, adv tuple, gen_reward) bundles are pushed to the buffer.
         """
         success_idx = self._resolve_success_term_idx()
         self.state_buffer.clear()
@@ -590,7 +521,6 @@ class MultiAgentRunner:
         term_mgr = unwrapped_env.termination_manager
         reward_mgr = unwrapped_env.reward_manager
 
-        # Initial sample for ALL envs (every env was just reset → fresh noise → fresh action)
         adversary_actions = self._sample_adversary_capture(obs, env_indices=None)
 
         zero_policy_actions = torch.zeros(
@@ -601,7 +531,6 @@ class MultiAgentRunner:
         num_episodes_done = 0
         num_successes = 0
 
-        collected_actions = []
         collected_rewards = []
 
         num_reward_terms = len(reward_mgr.active_terms)
@@ -612,11 +541,11 @@ class MultiAgentRunner:
 
         while total_steps < self.generation_max_steps and self.state_buffer.occupancy < self.state_buffer.capacity:
             with torch.inference_mode():
-                # Snapshot scene BEFORE the step — this is the validated state we'll
-                # push to the buffer if the env's episode terminates as success on this step.
+                # Snapshot BEFORE the step — this is the validated state pushed
+                # to the buffer if the episode terminates as success this step.
                 last_scene_state = unwrapped_env.scene.get_state(is_relative=True)
                 actions = torch.cat([zero_policy_actions, adversary_actions], dim=-1)
-                obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
+                obs, rewards, dones, _ = self.env.step(actions.to(self.env.device))
                 obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
 
                 total_steps += 1
@@ -625,7 +554,6 @@ class MultiAgentRunner:
                     done_env_indices = done_ids[:, 0]
                     num_episodes_done += done_env_indices.numel()
 
-                    collected_actions.append(adversary_actions[done_env_indices].clone())
                     collected_rewards.append(rewards[done_env_indices].clone())
 
                     success_mask = term_mgr._last_episode_dones[done_env_indices, success_idx]
@@ -633,10 +561,8 @@ class MultiAgentRunner:
                         success_env_ids = done_env_indices[success_mask]
                         num_successes += success_env_ids.numel()
                         success_count += success_env_ids.numel()
-                        # Push the (state, full adversary tuple, gen_reward) bundle.
-                        # The scratch holds the action+log_prob+mu+sigma+obs that the
-                        # adversary used to *generate* this state — that's what PPO
-                        # will train on.
+                        # Scratch holds the tuple the adversary used to *generate*
+                        # this state — that's what PPO trains on.
                         self.state_buffer.push(
                             last_scene_state, success_env_ids,
                             adv_obs=self._scratch_adv_obs,
@@ -648,8 +574,7 @@ class MultiAgentRunner:
                         )
                         per_term_success_total += reward_mgr._step_reward[success_env_ids].sum(dim=0)
 
-                    # Re-sample adversary stochastically for envs that just reset, and
-                    # update scratch so the new action's tuple is available next time.
+                    # Re-sample for reset envs and refresh scratch for next step.
                     new_adv_actions = self._sample_adversary_capture(obs, env_indices=done_env_indices)
                     adversary_actions[done_env_indices] = new_adv_actions[done_env_indices]
 
@@ -659,12 +584,9 @@ class MultiAgentRunner:
                           f"episodes={num_episodes_done}, successes={num_successes}, "
                           f"validity={validity:.3f}, buffer={self.state_buffer.occupancy}/{self.state_buffer.capacity}")
 
-        # Stack collected (action, reward) pairs
-        if collected_actions:
-            all_actions = torch.cat(collected_actions, dim=0)
+        if collected_rewards:
             all_rewards = torch.cat(collected_rewards, dim=0)
         else:
-            all_actions = torch.zeros(0, self.adversary_action_dim, device=self.device)
             all_rewards = torch.zeros(0, device=self.device)
 
         mean_validity = num_successes / max(num_episodes_done, 1)
@@ -684,7 +606,6 @@ class MultiAgentRunner:
             "mean_validity_rate": mean_validity,
             "mean_reward": mean_reward,
             "mean_state_quality": mean_success_quality,
-            "collected_actions": all_actions,
             "collected_rewards": all_rewards,
             "reward_term_names": reward_term_names,
             "reward_term_success_means": per_term_success_means,
@@ -692,18 +613,14 @@ class MultiAgentRunner:
         }
 
     # =====================================================================
-    # Buffer diagnostics (pure computation — writer calls live in log_phase_a)
+    # Buffer diagnostics
     # =====================================================================
 
     def _compute_buffer_diagnostics(
         self, per_env_episode_returns: list[list[float]]
     ) -> dict | None:
-        """Compute per-slot regret distribution before a Phase A refill.
-
-        Returns a dict of scalars consumed by ``log_phase_a`` (which emits them
-        on the cycle_id axis), or None when no slot accumulated any returns.
-        The ``[BufferDiag]`` console line is printed here since it's a
-        cycle-boundary diagnostic, not a logger-scoped scalar.
+        """Per-slot regret distribution. kept_top50_over_mean >= 1.5 means
+        high-regret slots are being wasted. Returns None if no slot has returns.
         """
         returns_with_data = [r for r in per_env_episode_returns if len(r) > 0]
         n = len(returns_with_data)
@@ -784,7 +701,15 @@ class MultiAgentRunner:
         self.eval_mode()
         if device is not None:
             self.alg.policy.to(device)
-        return self.alg.policy.act_inference
+        policy = self.alg.policy.act_inference
+        adv_dim = self.adversary_action_dim
+
+        def padded_policy(obs):
+            actions = policy(obs)
+            pad = torch.zeros(actions.shape[0], adv_dim, device=actions.device)
+            return torch.cat([actions, pad], dim=-1)
+
+        return padded_policy
 
     def train_mode(self) -> None:
         self.alg.policy.train()
@@ -802,7 +727,6 @@ class MultiAgentRunner:
     # =====================================================================
 
     def _configure_multi_gpu(self) -> None:
-        """Configure multi-gpu training."""
         self.gpu_world_size = int(os.getenv("WORLD_SIZE", "1"))
         self.is_distributed = self.gpu_world_size > 1
 
@@ -847,7 +771,6 @@ class MultiAgentRunner:
         action_dim: int,
         storage_horizon: int,
     ) -> PPO:
-        """Construct one PPO pipeline for a single agent."""
         alg_cfg = dict(alg_cfg)
         policy_cfg = dict(policy_cfg)
 
@@ -886,7 +809,6 @@ class MultiAgentRunner:
         return alg
 
     def _prepare_logging_writer(self) -> None:
-        """Prepare the logging writers."""
         if self.log_dir is not None and self.writer is None and not self.disable_logs:
             os.makedirs(self.log_dir, exist_ok=True)
 
