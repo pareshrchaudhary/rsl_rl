@@ -17,7 +17,6 @@ from rsl_rl.algorithms import PPO
 from rsl_rl.algorithms.simple_ppo import SimplePPO
 from rsl_rl.env import VecEnv
 from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, AsymmetricActorCritic, resolve_symmetry_config
-from rsl_rl.runners.eval_runner import EvalRunner
 from rsl_rl.utils import resolve_obs_groups, store_code_state
 from rsl_rl.utils.logger import log_phase_a, log_phase_b
 from rsl_rl.storage.reset_state_buffer import ResetStateBuffer
@@ -99,8 +98,6 @@ class MultiAgentRunner:
         print(f"[MultiAgentRunner] num_envs={self.env.num_envs}, "
               f"gen={self.generation_episode_length_s}s/{self.generation_max_steps}steps, "
               f"train={self.training_episode_length_s}s")
-
-        self.eval_runner = EvalRunner(self)
 
     # =====================================================================
     # Adversary sampling + manual transition population
@@ -494,7 +491,6 @@ class MultiAgentRunner:
                     self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
 
             ep_infos.clear()
-            self.eval_runner.run(it)
             if it == start_iter and self.log_dir is not None and not self.disable_logs:
                 git_file_paths = store_code_state(self.log_dir, self.git_status_repos)
                 if self.logger_type in ["wandb", "neptune"] and git_file_paths:

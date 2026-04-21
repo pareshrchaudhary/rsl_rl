@@ -18,7 +18,6 @@ import rsl_rl
 from rsl_rl.algorithms import PPO
 from rsl_rl.env import VecEnv
 from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, AsymmetricActorCritic, resolve_rnd_config, resolve_symmetry_config
-from rsl_rl.runners.eval_runner import EvalRunner
 from rsl_rl.utils import resolve_obs_groups, store_code_state
 from rsl_rl.utils.logger import extract_adversary_params
 
@@ -72,9 +71,6 @@ class OnPolicyRunner:
             self.adversary_param_extractor_fn = None
         if self.record_parameters and self.adversary_param_extractor_fn is None:
             self.record_parameters = False
-
-        # Eval tool
-        self.eval_runner = EvalRunner(self)
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False) -> None:
         # Initialize writer
@@ -215,9 +211,6 @@ class OnPolicyRunner:
                         group.attrs["num_samples"] = all_params_cpu.shape[0]
                 
                 raw_params_list.clear()  # Clear after processing
-
-            # Periodic evaluation
-            self.eval_runner.run(it)
 
             # Clear episode infos
             ep_infos.clear()
