@@ -10,7 +10,22 @@ import torch.optim as optim
 from tensordict import TensorDict
 
 from rsl_rl.modules import ActorCritic
-from rsl_rl.storage import RolloutStorage
+from rsl_rl.storage.rollout_storage_cage import RolloutStorage
+
+
+def _masked_mean(x: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
+    """Mean of ``x`` weighted by ``mask``; falls back to ``x.mean()`` when
+    ``mask`` is None or all-ones. Mirrors the helper in ``ppo.py`` so SimplePPO
+    losses stay equivalent to the old behavior when no inline-settling mask is
+    in play, and ignore settling transitions when one is.
+    """
+    if mask is None:
+        return x.mean()
+    if x.dim() == 1:
+        x = x.unsqueeze(-1)
+    if bool((mask == 1.0).all().item()):
+        return x.mean()
+    return (x * mask).sum() / mask.sum().clamp_min(1.0)
 
 
 class SimplePPO:
@@ -39,6 +54,10 @@ class SimplePPO:
         normalize_advantage_per_mini_batch: bool = False,
         # Baseline is an EMA of past returns; start at 0 so constant-regret rewards still learn.
         baseline_momentum: float = 0.9,
+        # KL(old || new) penalty toward the previous-cycle distribution. In the MARL
+        # adversary flow, all actions in a cycle are sampled with π_{n-1}, so
+        # old_mu/old_sigma == π_{n-1}'s distribution and this term anchors π_n to it.
+        kl_penalty_coef: float = 0.0,
         multi_gpu_cfg: dict | None = None,
         **_: object,
     ) -> None:
@@ -47,6 +66,7 @@ class SimplePPO:
 
         self.clip_param = float(clip_param)
         self.entropy_coef = float(entropy_coef)
+        self.kl_penalty_coef = float(kl_penalty_coef)
         self.num_learning_epochs = int(num_learning_epochs)
         self.num_mini_batches = int(num_mini_batches)
         self.max_grad_norm = float(max_grad_norm)
@@ -101,12 +121,19 @@ class SimplePPO:
         return self.transition.actions
 
     def process_env_step(
-        self, obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor, extras: dict[str, torch.Tensor]
+        self,
+        obs: TensorDict,
+        rewards: torch.Tensor,
+        dones: torch.Tensor,
+        extras: dict[str, torch.Tensor],
+        valid_mask: torch.Tensor | None = None,
     ) -> None:
         assert self.storage is not None
         self.policy.update_normalization(obs)
         self.transition.rewards = rewards.clone()
         self.transition.dones = dones
+        if valid_mask is not None:
+            self.transition.valid_mask = valid_mask
         self.storage.add_transitions(self.transition)
         self.transition.clear()
         self.policy.reset(dones)
@@ -136,6 +163,7 @@ class SimplePPO:
         mean_surrogate_loss = 0.0
         mean_entropy = 0.0
         mean_kl = 0.0
+        mean_kl_penalty = 0.0
         num_updates = 0
         for (
             obs_batch,
@@ -147,15 +175,30 @@ class SimplePPO:
             old_sigma_batch,
             hidden_states_batch,
             masks_batch,
+            valid_mask_batch,
         ) in generator:
             del dones_batch
             del hidden_states_batch
             del masks_batch
 
+            if valid_mask_batch is not None and bool((valid_mask_batch == 0.0).all().item()):
+                raise RuntimeError(
+                    "SimplePPO update received a minibatch with zero valid transitions."
+                )
+
             advantages_batch = rewards_batch - baseline
             if self.normalize_advantage_per_mini_batch:
                 with torch.no_grad():
-                    advantages_batch = (advantages_batch - advantages_batch.mean()) / (advantages_batch.std() + 1e-8)
+                    if valid_mask_batch is not None and not bool((valid_mask_batch == 1.0).all().item()):
+                        m = valid_mask_batch
+                        count = m.sum().clamp_min(1.0)
+                        adv_mean = (advantages_batch * m).sum() / count
+                        var = ((advantages_batch - adv_mean).pow(2) * m).sum() / count
+                        advantages_batch = (advantages_batch - adv_mean) / (var.clamp_min(1e-16).sqrt() + 1e-8)
+                    else:
+                        advantages_batch = (advantages_batch - advantages_batch.mean()) / (
+                            advantages_batch.std() + 1e-8
+                        )
 
             # Recompute distribution under current params
             self.policy.act(obs_batch)
@@ -167,10 +210,24 @@ class SimplePPO:
             surrogate_clipped = -torch.squeeze(advantages_batch) * torch.clamp(
                 ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
             )
-            surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
+            surrogate_loss = _masked_mean(torch.max(surrogate, surrogate_clipped), valid_mask_batch)
 
-            entropy_term = entropy_batch.mean()
+            entropy_term = _masked_mean(entropy_batch, valid_mask_batch)
             loss = surrogate_loss - self.entropy_coef * entropy_term
+
+            kl_penalty_term = None
+            if self.kl_penalty_coef > 0.0:
+                new_mu = self.policy.action_mean
+                new_sigma = self.policy.action_std
+                kl_per_elem = torch.sum(
+                    torch.log(new_sigma / old_sigma_batch + 1.0e-5)
+                    + (torch.square(old_sigma_batch) + torch.square(old_mu_batch - new_mu))
+                    / (2.0 * torch.square(new_sigma))
+                    - 0.5,
+                    dim=-1,
+                )
+                kl_penalty_term = _masked_mean(kl_per_elem, valid_mask_batch)
+                loss = loss + self.kl_penalty_coef * kl_penalty_term
 
             self.optimizer.zero_grad()
             loss.backward()
@@ -203,7 +260,7 @@ class SimplePPO:
                         - 0.5,
                         dim=-1,
                     )
-                    kl_mean = torch.mean(kl)
+                    kl_mean = _masked_mean(kl, valid_mask_batch)
                     if self.is_multi_gpu:
                         torch.distributed.all_reduce(kl_mean, op=torch.distributed.ReduceOp.SUM)
                         kl_mean /= self.gpu_world_size
@@ -226,6 +283,8 @@ class SimplePPO:
             mean_entropy += float(entropy_term.item())
             if kl_mean is not None:
                 mean_kl += float(kl_mean.item())
+            if kl_penalty_term is not None:
+                mean_kl_penalty += float(kl_penalty_term.item())
             num_updates += 1
 
         if num_updates > 0:
@@ -233,6 +292,8 @@ class SimplePPO:
             mean_entropy /= num_updates
             if self.desired_kl is not None:
                 mean_kl /= num_updates
+            if self.kl_penalty_coef > 0.0:
+                mean_kl_penalty /= num_updates
 
         self.storage.clear()
         loss_dict = {
@@ -242,6 +303,8 @@ class SimplePPO:
         }
         if self.desired_kl is not None:
             loss_dict["kl"] = mean_kl
+        if self.kl_penalty_coef > 0.0:
+            loss_dict["kl_penalty"] = mean_kl_penalty
         return loss_dict
 
     def broadcast_parameters(self) -> None:
