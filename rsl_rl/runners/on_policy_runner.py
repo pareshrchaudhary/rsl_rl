@@ -345,9 +345,6 @@ class OnPolicyRunner:
             )
             for key, value in locs["loss_dict"].items():
                 log_string += f"""{f"{key}:":>{pad}} {value:.4f}\n"""
-            if "max_batch_total_reward" in locs and "regret" in locs:
-                log_string += f"""{"Max batch reward:":>{pad}} {locs["max_batch_total_reward"]:.2f}\n"""
-                log_string += f"""{"Regret:":>{pad}} {locs["regret"]:.2f}\n"""
 
         log_string += ep_string
         log_string += (

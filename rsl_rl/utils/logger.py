@@ -159,119 +159,7 @@ def extract_cage_physics_params(
     return params
 
 
-def log_phase_a(
-    writer,
-    alg_adversary,
-    cycle_id: int,
-    step: int,
-    gen_stats: dict | None,
-    buffer_diag: dict | None,
-    cycle_adv_loss_sums: dict[str, float],
-    cycle_adv_loss_count: int,
-    cycle_adv_total_rewards: list[float],
-    cycle_adv_gen_rewards: list[float],
-    cycle_adv_regrets: list[float],
-    width: int = 80,
-    pad: int = 35,
-) -> None:
-    """Log Phase A (generator + adversary) metrics at the current iteration step.
-
-    Called once per refill event: the bootstrap refill and each in-loop refill
-    thereafter. Does not log any protagonist metrics; tag namespaces
-    (``Adversary/*``, ``Generator/*``, ``Generator_Reward_Success/*``,
-    ``BufferDiag/*``) keep Phase A curves separate from Phase B on the shared
-    iteration x-axis. Because Phase A fires only at cycle boundaries, its
-    points are naturally sparse on that axis — no carry-forward between cycles.
-
-    Adversary reward is decomposed into three scalars so plots show which
-    component drives PPO:
-        total  = beta * gen_reward + regret   (what PPO actually trains on)
-        gen    = gen_reward                   (raw validity/shaping signal)
-        regret = max(returns) - mean(returns) (0 for slots with <K episodes)
-
-    Args:
-        writer: Summary writer for logging.
-        alg_adversary: Adversary algorithm instance (for noise std + lr).
-        cycle_id: Refill index, used only in the console banner.
-        step: Monotonic step (iteration index) used as the writer x-axis. This
-            must be monotonically non-decreasing across all writer calls so
-            wandb's global-step constraint is satisfied.
-        gen_stats: Dict returned by ``_run_generation_loop`` (or None).
-        buffer_diag: Dict of per-slot regret distribution stats (or None).
-        cycle_adv_loss_sums: Running per-key loss sums for the cycle.
-        cycle_adv_loss_count: Number of adversary updates that fired this cycle.
-        cycle_adv_total_rewards: Per-update mean of beta*gen_reward + regret.
-        cycle_adv_gen_rewards: Per-update mean of raw gen_reward.
-        cycle_adv_regrets: Per-update mean regret (0 for starved-slot entries).
-        width: Console line width.
-        pad: Right-alignment pad for the console block.
-    """
-    if gen_stats is not None:
-        writer.add_scalar("Generator/validity_rate", gen_stats["mean_validity_rate"], step)
-        writer.add_scalar("Generator/mean_reward", gen_stats["mean_reward"], step)
-        writer.add_scalar("Generator/state_quality", gen_stats["mean_state_quality"], step)
-        writer.add_scalar("Generator/num_successes", gen_stats["num_successes"], step)
-        writer.add_scalar("Generator/num_episodes_done", gen_stats["num_episodes_done"], step)
-        writer.add_scalar("Generator/buffer_fill_pct", gen_stats["buffer_fill_pct"], step)
-
-        for tname, tval_suc in zip(
-            gen_stats["reward_term_names"],
-            gen_stats["reward_term_success_means"],
-        ):
-            writer.add_scalar(f"Generator_Reward_Success/{tname}", tval_suc, step)
-
-    if buffer_diag is not None:
-        writer.add_scalar("BufferDiag/regret_mean", buffer_diag["regret_mean"], step)
-        writer.add_scalar("BufferDiag/regret_p90", buffer_diag["regret_p90"], step)
-        writer.add_scalar("BufferDiag/regret_max", buffer_diag["regret_max"], step)
-        writer.add_scalar("BufferDiag/kept_top50_over_mean", buffer_diag["kept_top50_over_mean"], step)
-
-    adv_loss_means: dict[str, float] = {}
-    if cycle_adv_loss_count > 0:
-        adv_loss_means = {k: v / cycle_adv_loss_count for k, v in cycle_adv_loss_sums.items()}
-        for key, value in adv_loss_means.items():
-            writer.add_scalar(f"Adversary/Loss/{key}", value, step)
-
-    writer.add_scalar("Adversary/Loss/learning_rate", alg_adversary.learning_rate, step)
-    adv_mean_std = alg_adversary.policy.action_std.mean()
-    writer.add_scalar("Adversary/mean_noise_std", adv_mean_std.item(), step)
-
-    mean_adv_total: float | None = None
-    mean_adv_gen: float | None = None
-    mean_adv_regret: float | None = None
-    if cycle_adv_total_rewards:
-        mean_adv_total = statistics.mean(cycle_adv_total_rewards)
-        writer.add_scalar("Adversary/mean_total_reward", mean_adv_total, step)
-    if cycle_adv_gen_rewards:
-        mean_adv_gen = statistics.mean(cycle_adv_gen_rewards)
-        writer.add_scalar("Adversary/mean_gen_reward", mean_adv_gen, step)
-    if cycle_adv_regrets:
-        mean_adv_regret = statistics.mean(cycle_adv_regrets)
-        writer.add_scalar("Adversary/mean_regret", mean_adv_regret, step)
-
-    header = f" \033[1m Phase A cycle {cycle_id} \033[0m "
-    log_string = f"""{"#" * width}\n{header.center(width, " ")}\n\n"""
-    if gen_stats is not None:
-        log_string += f"""{"Validity rate:":>{pad}} {gen_stats["mean_validity_rate"]:.3f}\n"""
-        log_string += f"""{"Buffer fill pct:":>{pad}} {gen_stats["buffer_fill_pct"]:.2f}\n"""
-        log_string += f"""{"Num successes:":>{pad}} {int(gen_stats["num_successes"])}\n"""
-        log_string += f"""{"Num episodes done:":>{pad}} {int(gen_stats["num_episodes_done"])}\n"""
-    log_string += f"""{"Adversary noise std:":>{pad}} {adv_mean_std.item():.2f}\n"""
-    if adv_loss_means:
-        for key, value in adv_loss_means.items():
-            log_string += f"""{f"Mean adversary {key} loss:":>{pad}} {value:.4f}\n"""
-        log_string += f"""{"Adversary updates in cycle:":>{pad}} {cycle_adv_loss_count}\n"""
-    if mean_adv_total is not None:
-        log_string += f"""{"Mean adversary total reward:":>{pad}} {mean_adv_total:.4f}\n"""
-    if mean_adv_gen is not None:
-        log_string += f"""{"Mean adversary gen reward:":>{pad}} {mean_adv_gen:.4f}\n"""
-    if mean_adv_regret is not None:
-        log_string += f"""{"Mean adversary regret:":>{pad}} {mean_adv_regret:.4f}\n"""
-    log_string += f"""{"-" * width}\n"""
-    print(log_string)
-
-
-def log_phase_b(
+def log_iter_metrics(
     writer,
     device: str | torch.device,
     num_steps_per_env: int,
@@ -285,10 +173,10 @@ def log_phase_b(
     width: int = 80,
     pad: int = 35,
 ) -> None:
-    """Log Phase B (protagonist) metrics on the iteration axis.
+    """Log protagonist-side metrics on the iteration axis.
 
-    Called every iteration. Does not log any adversary/generator metrics; those
-    are owned by ``log_phase_a`` on the cycle_id axis.
+    Called every iteration. Adversary-side metrics are logged separately by
+    the runner's ``_emit_inline_iter_metrics`` under ``Adversary/*``.
 
     Args:
         writer: Summary writer for logging.
@@ -342,17 +230,6 @@ def log_phase_b(
     writer.add_scalar("Perf/collection time", locs["collection_time"], locs["it"])
     writer.add_scalar("Perf/learning_time", locs["learn_time"], locs["it"])
 
-    if (
-        "batch_episode_count" in locs
-        and "max_batch_total_reward" in locs
-        and "mean_batch_total_reward" in locs
-        and "regret" in locs
-        and locs["batch_episode_count"] > 0
-    ):
-        writer.add_scalar("Metrics/max_batch_total_reward", locs["max_batch_total_reward"], locs["it"])
-        writer.add_scalar("Metrics/mean_batch_total_reward", locs["mean_batch_total_reward"], locs["it"])
-        writer.add_scalar("Metrics/regret", locs["regret"], locs["it"])
-
     if len(locs["rewbuffer"]) > 0:
         writer.add_scalar("Train/mean_reward", statistics.mean(locs["rewbuffer"]), locs["it"])
         writer.add_scalar("Train/mean_episode_length", statistics.mean(locs["lenbuffer"]), locs["it"])
@@ -364,37 +241,21 @@ def log_phase_b(
 
     header = f" \033[1m Learning iteration {locs['it']}/{locs['tot_iter']} \033[0m "
 
+    log_string = (
+        f"""{"#" * width}\n"""
+        f"""{header.center(width, " ")}\n\n"""
+        f"""{"Computation:":>{pad}} {fps:.0f} steps/s (collection: {locs["collection_time"]:.3f}s, learning {
+            locs["learn_time"]:.3f}s)\n"""
+        f"""{"Mean action noise std:":>{pad}} {mean_std.item():.2f}\n"""
+    )
     if len(locs["rewbuffer"]) > 0:
-        log_string = (
-            f"""{"#" * width}\n"""
-            f"""{header.center(width, " ")}\n\n"""
-            f"""{"Computation:":>{pad}} {fps:.0f} steps/s (collection: {locs["collection_time"]:.3f}s, learning {
-                locs["learn_time"]:.3f}s)\n"""
-            f"""{"Mean action noise std:":>{pad}} {mean_std.item():.2f}\n"""
-        )
         for key, value in locs["loss_dict"].items():
             log_string += f"""{f"Mean {key} loss:":>{pad}} {value:.4f}\n"""
         log_string += f"""{"Mean reward:":>{pad}} {statistics.mean(locs["rewbuffer"]):.2f}\n"""
-        log_string += f"""{"Batch episode count:":>{pad}} {int(locs.get("batch_episode_count", 0))}\n"""
-        log_string += f"""{"Max batch reward:":>{pad}} {locs["max_batch_total_reward"]:.4f}\n"""
-        log_string += f"""{"Mean batch reward:":>{pad}} {locs["mean_batch_total_reward"]:.4f}\n"""
-        log_string += f"""{"Regret (batch max-mean):":>{pad}} {locs["regret"]:.4f}\n"""
         log_string += f"""{"Mean episode length:":>{pad}} {statistics.mean(locs["lenbuffer"]):.2f}\n"""
     else:
-        log_string = (
-            f"""{"#" * width}\n"""
-            f"""{header.center(width, " ")}\n\n"""
-            f"""{"Computation:":>{pad}} {fps:.0f} steps/s (collection: {locs["collection_time"]:.3f}s, learning {
-                locs["learn_time"]:.3f}s)\n"""
-            f"""{"Mean action noise std:":>{pad}} {mean_std.item():.2f}\n"""
-        )
         for key, value in locs["loss_dict"].items():
             log_string += f"""{f"{key}:":>{pad}} {value:.4f}\n"""
-        if "max_batch_total_reward" in locs and "regret" in locs:
-            log_string += f"""{"Batch episode count:":>{pad}} {int(locs.get("batch_episode_count", 0))}\n"""
-            log_string += f"""{"Max batch reward:":>{pad}} {locs["max_batch_total_reward"]:.4f}\n"""
-            log_string += f"""{"Mean batch reward:":>{pad}} {locs["mean_batch_total_reward"]:.4f}\n"""
-            log_string += f"""{"Regret (batch max-mean):":>{pad}} {locs["regret"]:.4f}\n"""
 
     log_string += ep_string
     log_string += (
