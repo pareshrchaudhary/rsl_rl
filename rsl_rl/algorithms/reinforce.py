@@ -15,7 +15,7 @@ from rsl_rl.storage.rollout_storage_cage import RolloutStorage
 
 def _masked_mean(x: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
     """Mean of ``x`` weighted by ``mask``; falls back to ``x.mean()`` when
-    ``mask`` is None or all-ones. Mirrors the helper in ``ppo.py`` so SimplePPO
+    ``mask`` is None or all-ones. Mirrors the helper in ``ppo.py`` so Reinforce
     losses stay equivalent to the old behavior when no inline-settling mask is
     in play, and ignore settling transitions when one is.
     """
@@ -28,7 +28,7 @@ def _masked_mean(x: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
     return (x * mask).sum() / mask.sum().clamp_min(1.0)
 
 
-class SimplePPO:
+class Reinforce:
     """Simplified PPO: actor-only bandit updates with PPO-style ratio clipping.
 
     This is intended for the adversary in a one-step (bandit) setting:
@@ -183,7 +183,7 @@ class SimplePPO:
 
             if valid_mask_batch is not None and bool((valid_mask_batch == 0.0).all().item()):
                 raise RuntimeError(
-                    "SimplePPO update received a minibatch with zero valid transitions."
+                    "Reinforce update received a minibatch with zero valid transitions."
                 )
 
             advantages_batch = rewards_batch - baseline

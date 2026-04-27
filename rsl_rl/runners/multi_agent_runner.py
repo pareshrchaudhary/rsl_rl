@@ -3,25 +3,6 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Inline-settling multi-agent runner.
-
-Every env maintains a mode in ``{LIVE, SETTLING}`` and transitions between
-them continuously. LIVE envs are driven
-by the protagonist and contribute gradient to PPO. SETTLING envs are driven
-by the adversary for a short window (``settle_max_steps`` control steps);
-their transitions are stored with ``valid_mask=0`` so PPO ignores them. On
-settle-valid, the pre-success scene state is written back to sim and the env
-flips to LIVE for ``regret_k`` episodes, then flips back to SETTLING with a
-fresh adversary proposal. Teacher tuples (one per proposal) accumulate in a
-commit ring that drains into an adversary PPO update once every rank has
-``num_envs`` commits.
-
-The ``episode_length_buf`` manipulation at LIVE→SETTLING reuses Isaac's
-natural time_out + full reset-event chain to close each settle window, so
-adversary validation runs through the same reset-event path the protagonist
-uses — just per-env instead of global.
-"""
-
 from __future__ import annotations
 
 import os
@@ -34,18 +15,15 @@ from tensordict import TensorDict
 
 import rsl_rl
 from rsl_rl.algorithms.ppo_cage import PPO
-from rsl_rl.algorithms.simple_ppo import SimplePPO
+from rsl_rl.algorithms.reinforce import Reinforce
 from rsl_rl.env import VecEnv
 from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, AsymmetricActorCritic, resolve_symmetry_config
 from rsl_rl.utils import resolve_obs_groups, store_code_state
 from rsl_rl.utils.logger import log_iter_metrics
 
-
-# Per-env mode flag; uint8 on device. LIVE envs contribute PPO gradient;
-# SETTLING envs are adversary-driven and masked out of the loss.
+# LIVE contributes PPO gradient; SETTLING is adversary-driven, masked out.
 MODE_LIVE = 0
 MODE_SETTLING = 1
-
 
 @dataclass
 class InlineSettlingConfig:
@@ -80,9 +58,7 @@ class MultiAgentRunner:
         self.num_steps_per_env = self.cfg["num_steps_per_env"]
         self.save_interval = self.cfg["save_interval"]
 
-        # Action split: student drives first N-adversary_action_dim entries,
-        # adversary drives the tail. Concatenated per-step with per-env mode
-        # routing (zero student on SETTLING, zero adversary on LIVE).
+        # Student drives the head, adversary the tail of the concat action.
         self.adversary_action_dim = self.cfg["adversary_robot_parameters"]
         self.policy_action_dim = int(self.env.num_actions - self.adversary_action_dim)
 
@@ -95,7 +71,7 @@ class MultiAgentRunner:
             adversary_obs_groups_raw["critic"] = list(adversary_obs_groups_raw.get("policy", []))
         self.adversary_obs_groups = resolve_obs_groups(obs, adversary_obs_groups_raw, ["critic"])
 
-        # IPPO: independent PPO for protagonist; SimplePPO bandit for adversary.
+        # IPPO: independent PPO for protagonist; Reinforce bandit for adversary.
         self.alg = self._construct_agent_algorithm(
             obs=obs,
             obs_groups=self.cfg["obs_groups"],
@@ -129,42 +105,68 @@ class MultiAgentRunner:
 
         self.inline = InlineSettlingConfig.from_cfg(self.cfg)
 
-        # Per-env mode + settle bookkeeping. All resident on device, mutated
-        # in-place each step. At 65k envs these are ~2MB total; cheap.
+        # Per-env mode + settle bookkeeping.
         n = self.env.num_envs
         self.env_mode = torch.full((n,), MODE_LIVE, dtype=torch.uint8, device=self.device)
         self.settle_remaining = torch.zeros(n, dtype=torch.int32, device=self.device)
         self.settle_retries = torch.zeros(n, dtype=torch.int32, device=self.device)
-        # Pre-success scene snapshot + proposal gen_reward, filled on
-        # success-in-settle and restored on settle-valid. Shape matches
-        # scene.get_state() output; allocated lazily on first stash.
+        # Pre-success snapshot + proposal gen_reward (lazy-allocated on first stash).
         self._pre_success_state: dict | None = None
         self._pending_teacher = torch.zeros(n, dtype=torch.bool, device=self.device)
         self._pending_gen_reward = torch.zeros(n, dtype=torch.float, device=self.device)
-        # K-episode pinning: protagonist gets ``regret_k`` LIVE episodes on the
-        # same validated start state before the env flips to a new proposal.
+        # K-episode pinning state.
         self._live_episodes_since_settle = torch.zeros(n, dtype=torch.int32, device=self.device)
         self._per_env_live_returns: list[list[float]] = [[] for _ in range(n)]
-        # Teacher commit ring — drained into an adversary PPO update once all
-        # ranks have ``_teacher_batch_size_target`` tuples.
+        # Teacher commit ring: drained once every rank has target tuples.
+        # ``regret`` is None for giveup entries so update-time logging can
+        # restrict the regret mean to K-pin entries.
         self._teacher_commit: dict[str, list] = {
             "obs": [], "action": [], "log_prob": [], "mu": [], "sigma": [],
-            "gen_reward": [], "reward": [],
+            "gen_reward": [], "reward": [], "regret": [],
         }
-        # Latest adversary-update snapshot, emitted per-iter under
-        # ``Adversary/*`` so WandB panels configured for the old cycle-based
-        # logger keep populating.
+        # Latest adversary-update snapshot; emitted per-iter under ``Adversary/*``.
         self._inline_last_adv_loss: dict[str, float] = {}
         self._inline_last_adv_rewards: dict[str, float] = {}
 
-        # Per-iter running buffers of K-pin commit stats. Reset each iter,
-        # averaged into ``Metrics/adversary/*`` — one scalar per iter, mean
-        # over every K-pin commit that fired during the iter.
-        self._iter_commit_stats: dict[str, list[float]] = {
-            "regret": [], "max_batch_returns": [], "mean_batch_returns": [],
-        }
-
         self._success_term_idx: int | None = None
+
+        self._install_live_filtered_reward_logging()
+
+    # =====================================================================
+    # LIVE-only reward-log filtering
+    # =====================================================================
+
+    def _install_live_filtered_reward_logging(self) -> None:
+        """Swap ``RewardManager.reset`` for a LIVE-filtered version so
+        ``Episode_Reward/<term>`` scalars reflect LIVE episodes only.
+        SETTLING resets still zero ``_episode_sums`` for bookkeeping; we
+        just exclude them from the mean the logger sees. Mirrors the
+        pattern ``TaskCommand.reset`` uses for its metrics.
+        """
+        reward_mgr = self.env.unwrapped.reward_manager
+        env_mode = self.env_mode
+
+        def reset(env_ids=None):
+            if env_ids is None:
+                env_ids_t = torch.arange(reward_mgr.num_envs, device=reward_mgr.device)
+            elif isinstance(env_ids, torch.Tensor):
+                env_ids_t = env_ids
+            else:
+                env_ids_t = torch.as_tensor(list(env_ids), dtype=torch.long, device=reward_mgr.device)
+            live_ids = env_ids_t[env_mode[env_ids_t] == MODE_LIVE]
+            max_ep = reward_mgr._env.max_episode_length_s
+            extras: dict[str, torch.Tensor] = {}
+            for key, sums in reward_mgr._episode_sums.items():
+                if live_ids.numel() > 0:
+                    extras["Episode_Reward/" + key] = torch.mean(sums[live_ids]) / max_ep
+                else:
+                    extras["Episode_Reward/" + key] = torch.empty(0, device=reward_mgr.device)
+                sums[env_ids_t] = 0.0
+            for term_cfg in reward_mgr._class_term_cfgs:
+                term_cfg.func.reset(env_ids=env_ids_t)
+            return extras
+
+        reward_mgr.reset = reset
 
     # =====================================================================
     # Adversary sampling + manual transition population
@@ -173,11 +175,8 @@ class MultiAgentRunner:
     def _sample_adversary_capture(
         self, obs, env_indices: torch.Tensor | None = None
     ) -> torch.Tensor:
-        """Sample adversary actions and snapshot ``(obs, action, log_prob, mu, sigma)``
-        into per-env scratch tensors. Uses ``policy.act`` (stochastic) so the PPO
-        ratio at update time is honest. ``env_indices=None`` refreshes all envs;
-        otherwise only those slots are overwritten.
-        """
+        """Sample adversary actions and snapshot (obs, action, log_prob, mu, sigma)
+        into per-env scratch. ``env_indices=None`` refreshes all rows."""
         with torch.inference_mode():
             action = self.alg_adversary.policy.act(obs).detach()
             log_prob = self.alg_adversary.policy.get_actions_log_prob(action).detach()
@@ -208,10 +207,8 @@ class MultiAgentRunner:
     def _adversary_update_from_tuples(
         self, tuples: dict, rewards: torch.Tensor, last_obs
     ) -> dict:
-        """SimplePPO update that bypasses ``alg.act()`` and uses the
-        log_prob/mu/sigma stashed at action-time — so the ratio is correct for
-        action samples drawn under π_{n-1}.
-        """
+        """Reinforce update using log_prob/mu/sigma stashed at action-time so
+        the ratio is honest for samples drawn under π_{n-1}."""
         alg = self.alg_adversary
         n = tuples["action"].shape[0]
 
@@ -224,7 +221,7 @@ class MultiAgentRunner:
 
         dummy_dones = torch.ones((n, 1), dtype=torch.float, device=self.device)
         alg.process_env_step(tuples["obs"], rewards, dummy_dones, {})
-        alg.compute_returns(last_obs)  # no-op for SimplePPO
+        alg.compute_returns(last_obs)  # no-op for Reinforce
         return alg.update()
 
     def _resolve_success_term_idx(self) -> int:
@@ -254,9 +251,14 @@ class MultiAgentRunner:
             "sigma": self._scratch_adv_sigma[env_ids].detach().clone(),
         }
 
-    def _commit_teacher(self, env_id: int, gen_reward: float, combined_reward: float) -> None:
-        """Append a single teacher tuple to the commit ring using the env's
-        current scratch slot. Clears the pending flag."""
+    def _commit_teacher(
+        self,
+        env_id: int,
+        gen_reward: float,
+        combined_reward: float,
+        regret: float | None = None,
+    ) -> None:
+        """Append one teacher tuple to the ring and clear the pending flag."""
         idx_t = torch.tensor([env_id], dtype=torch.long, device=self.device)
         tup = self._snapshot_teacher_tuple(idx_t)
         self._teacher_commit["obs"].append(tup["obs"])
@@ -266,6 +268,7 @@ class MultiAgentRunner:
         self._teacher_commit["sigma"].append(tup["sigma"])
         self._teacher_commit["gen_reward"].append(float(gen_reward))
         self._teacher_commit["reward"].append(float(combined_reward))
+        self._teacher_commit["regret"].append(regret)
         self._pending_teacher[env_id] = False
         self._pending_gen_reward[env_id] = 0.0
 
@@ -274,13 +277,9 @@ class MultiAgentRunner:
         return int(bs) if bs is not None else self.env.num_envs
 
     def _maybe_fire_adversary_update(self, last_obs) -> dict | None:
-        """Drain the commit ring into an adversary PPO update when every rank
-        has at least ``_teacher_batch_size_target`` tuples.
-
-        MIN-syncs the ready decision across ranks so every rank fires together
-        or skips together — otherwise the NCCL all_reduce inside ``alg.update()``
-        would deadlock against a rank still doing protagonist rollout.
-        """
+        """Drain the ring into an adversary PPO update when every rank has
+        target tuples. MIN-syncs readiness across ranks to avoid an NCCL
+        all_reduce deadlock inside ``alg.update()``."""
         target = self._teacher_batch_size_target()
         local_ready = int(len(self._teacher_commit["reward"]) >= target)
         if self.is_distributed:
@@ -304,6 +303,7 @@ class MultiAgentRunner:
         sigma_list = _pop_n(self._teacher_commit["sigma"], target)
         gen_reward_list = _pop_n(self._teacher_commit["gen_reward"], target)
         reward_list = _pop_n(self._teacher_commit["reward"], target)
+        regret_list = _pop_n(self._teacher_commit["regret"], target)
 
         stacked_obs = {k: torch.cat([o[k] for o in obs_list], dim=0) for k in obs_list[0].keys()}
         adv_tuples = {
@@ -319,50 +319,35 @@ class MultiAgentRunner:
         self._prepare_adversary_storage(n=target, obs_spec=adv_tuples["obs"])
         loss_dict = self._adversary_update_from_tuples(adv_tuples, combined_rewards, last_obs=last_obs)
 
+        kpin_regrets = [r for r in regret_list if r is not None]
         self._inline_last_adv_loss = {k: float(v) for k, v in loss_dict.items()}
         self._inline_last_adv_rewards = {
             "mean_total_reward": float(combined_rewards.mean().item()),
             "mean_gen_reward": float(adv_tuples["gen_reward"].mean().item()),
-            "mean_regret": float(
-                (combined_rewards.squeeze(-1) - self.beta_gen_reward * adv_tuples["gen_reward"]).mean().item()
-            ),
+            "mean_regret": float(sum(kpin_regrets) / len(kpin_regrets)) if kpin_regrets else float("nan"),
         }
         return loss_dict
 
     def _emit_inline_iter_metrics(self, writer, it: int) -> None:
-        """Push the most-recent adversary-update stats under ``Adversary/*`` and
-        the per-iter K-pin commit stats under ``Metrics/adversary/*`` — the
-        latter alongside ``Metrics/task_command/*`` so they aggregate on the
-        same dashboard. Values are means over every commit fired during the
-        iter. Buffer is reset after emission."""
+        """Emit the latest adversary-update snapshot under ``Adversary/*``.
+        Values plateau between updates (ring-fill cadence) and refresh on
+        each ``_maybe_fire_adversary_update`` that actually fires."""
         if writer is not None:
             for k, v in self._inline_last_adv_loss.items():
                 writer.add_scalar(f"Adversary/{k}", v, it)
             for k, v in self._inline_last_adv_rewards.items():
                 writer.add_scalar(f"Adversary/{k}", v, it)
-
-        commit_means: dict[str, float] = {}
-        for k, vals in self._iter_commit_stats.items():
-            if vals:
-                commit_means[k] = sum(vals) / len(vals)
-        if commit_means:
-            if writer is not None:
-                for k, v in commit_means.items():
-                    writer.add_scalar(f"Metrics/adversary/{k}", v, it)
-            line = " | ".join(f"{k}: {v:.4f}" for k, v in commit_means.items())
-            print(f"{'Metrics/adversary:':>35} {line}")
-        for vals in self._iter_commit_stats.values():
-            vals.clear()
+        if self._inline_last_adv_rewards:
+            line = " | ".join(f"{k}: {v:.4f}" for k, v in self._inline_last_adv_rewards.items())
+            print(f"{'Adversary:':>35} {line}")
 
     # =====================================================================
     # Pre-success state capture + restore
     # =====================================================================
 
     def _write_state_to_sim(self, state: dict, env_ids: torch.Tensor) -> None:
-        """Restore the saved scene state for ``env_ids``: articulation root +
-        velocity + joint state, rigid object root + velocity, env-relative
-        xyz with ``env_origins`` added back in. ``scene.write_data_to_sim()``
-        flushes the writes."""
+        """Restore saved scene state for ``env_ids`` (articulation + rigid
+        objects, env-relative xyz rebased with ``env_origins``)."""
         if env_ids.numel() == 0:
             return
         scene = self.env.unwrapped.scene
@@ -397,10 +382,17 @@ class MultiAgentRunner:
                             fields["root_velocity"][env_ids].clone(), env_ids=env_ids
                         )
             scene.write_data_to_sim()
+            # Obs history was first-pushed with the post-reset random obs
+            # before we overwrote the scene; clear it + prev_action so the
+            # next step repopulates from the restored state.
+            env_unwrapped = self.env.unwrapped
+            for group_buffers in env_unwrapped.observation_manager._group_obs_term_history_buffer.values():
+                for circular_buffer in group_buffers.values():
+                    circular_buffer.reset(batch_ids=env_ids)
+            env_unwrapped.action_manager._prev_action[env_ids] = 0.0
 
     def _stash_pre_success_for(self, state: dict, env_ids: torch.Tensor) -> None:
-        """Write a per-env slice of ``state`` into ``self._pre_success_state``.
-        Lazily allocates the full-env-size scratch on first call."""
+        """Write per-env slice of ``state`` into ``_pre_success_state`` (lazy-alloc)."""
         if env_ids.numel() == 0:
             return
         if self._pre_success_state is None:
@@ -428,30 +420,27 @@ class MultiAgentRunner:
         scene_state_pre: dict,
         rewards: torch.Tensor,
         obs: TensorDict,
+        cur_reward_sum: torch.Tensor,
+        cur_episode_length: torch.Tensor,
     ) -> bool:
         """Resolve per-env mode transitions after a sim-step.
 
-        Logic:
-          1. If a SETTLING env saw ``success`` this step, snapshot the pre-step
-             scene state + the step's reward as the pending proposal's ``gen_reward``.
-          2. Any done during SETTLING is a resolution event. Success → valid;
-             anything else (abnormal / natural time_out) → invalid.
-          3. Valid: write the stashed pre-success state back to sim, flip to
-             LIVE, clear K-episode counter.
-          4. Invalid with retries left: push ``episode_length_buf`` near
-             ``max_episode_length`` so Isaac's natural time_out fires
-             ``settle_max_steps`` later; resample adversary.
-          5. Invalid with retries exhausted: commit pending tuple with the
-             fixed penalty, force the env LIVE.
-          6. A LIVE done with a pending teacher: if fewer than ``regret_k``
-             returns banked, re-write the same pre-success state and stay LIVE
-             (K-episode pinning); on the Kth, compute regret, commit, flip to
-             SETTLING with a fresh proposal.
-          7. A LIVE done without a pending teacher (bootstrap): flip to
-             SETTLING with a fresh proposal.
+        1. SETTLING success → stash pre-step state + gen_reward.
+        2. SETTLING done = resolution. Success → valid; else invalid.
+        3. Valid → restore pre-success state, flip LIVE.
+        4. Invalid + retries left → push ``episode_length_buf`` for another
+           time_out ``settle_max_steps`` later; resample adversary.
+        5. Invalid + retries exhausted → commit with penalty, force LIVE.
+        6. LIVE done + pending teacher: if < ``regret_k`` replays, re-apply
+           pre-success (K-pin); else compute regret, commit, flip SETTLING.
+        7. LIVE done w/o pending teacher → flip SETTLING w/ fresh proposal.
 
-        Returns True iff any sim state was written — the caller must refresh
-        ``obs`` so the next action sample reflects the restored configuration.
+        ``cur_reward_sum`` and ``cur_episode_length`` are the caller's
+        per-env LIVE-return accumulators. They are zeroed on every
+        SETTLING→LIVE transition (valid and giveup) so accumulated
+        SETTLING-phase values never carry into LIVE banking.
+
+        Returns True iff sim state was written (caller must refresh ``obs``).
         """
         state_was_written = False
         max_ep_len = int(self.env.max_episode_length)
@@ -461,7 +450,7 @@ class MultiAgentRunner:
         live_mask = ~settling_mask
         dones_bool = dones.to(torch.bool).view(-1)
 
-        # ---- (1) Stash pre-success state for SETTLING envs that saw success.
+        # (1) Stash pre-success state.
         success_this_step = term_mgr._last_episode_dones[:, success_idx].to(torch.bool) & dones_bool
         success_in_settle = success_this_step & settling_mask
         if success_in_settle.any():
@@ -469,7 +458,7 @@ class MultiAgentRunner:
             self._stash_pre_success_for(scene_state_pre, success_ids)
             self._pending_gen_reward[success_ids] = rewards[success_ids].view(-1).float()
 
-        # ---- (2) Resolution: any SETTLING done this step, or timer hit 0.
+        # (2) Resolve SETTLING dones / timer expirations.
         done_settling = settling_mask & dones_bool
         timed_out_no_done = settling_mask & (self.settle_remaining == 0) & ~dones_bool
         resolved = done_settling | timed_out_no_done
@@ -478,7 +467,7 @@ class MultiAgentRunner:
             valid = resolved & success_in_settle
             invalid = resolved & ~valid
 
-            # ---- (3) Valid settles flip to LIVE on pre-success state.
+            # (3) Valid → LIVE on pre-success state.
             if valid.any():
                 valid_ids = valid.nonzero(as_tuple=False).squeeze(-1)
                 if self._pre_success_state is not None:
@@ -490,8 +479,17 @@ class MultiAgentRunner:
                 self._live_episodes_since_settle[valid_ids] = 0
                 for eid in valid_ids.tolist():
                     self._per_env_live_returns[eid] = []
+                # Fresh LIVE episode on restored state: clear RNN hidden
+                # state and the LIVE-return accumulator so nothing from the
+                # SETTLING window (or any prior attempt) leaks in. Valid
+                # envs had dones=True so ``policy.reset(dones)`` already
+                # fired in ``process_env_step``; we re-assert here to keep
+                # the invariant mode-change-site-local.
+                self._reset_student_rnn(valid_ids)
+                cur_reward_sum[valid_ids] = 0.0
+                cur_episode_length[valid_ids] = 0.0
 
-            # ---- (4,5) Invalid settles: retry if budget left, else forced-LIVE.
+            # (4,5) Invalid → retry or forced-LIVE.
             if invalid.any():
                 invalid_ids = invalid.nonzero(as_tuple=False).squeeze(-1)
                 can_retry = self.settle_retries[invalid_ids] < self.inline.max_resample_retries
@@ -504,6 +502,11 @@ class MultiAgentRunner:
                     self.settle_remaining[retry_ids] = self.inline.settle_max_steps
                     self.settle_retries[retry_ids] += 1
                     self._sample_adversary_capture(obs, env_indices=retry_ids)
+                    # ``timed_out_no_done`` retries never saw a ``done``, so
+                    # ``policy.reset(dones)`` didn't clear their RNN. Clear
+                    # explicitly so the new SETTLING attempt starts fresh
+                    # (no-op for retries that did see a done).
+                    self._reset_student_rnn(retry_ids)
 
                 if giveup_ids.numel() > 0:
                     for eid in giveup_ids.tolist():
@@ -513,12 +516,24 @@ class MultiAgentRunner:
                                 gen_reward=float(self._pending_gen_reward[eid].item()),
                                 combined_reward=self.inline.invalid_settle_penalty,
                             )
+                    # Giveup fires on ``timed_out_no_done`` — Isaac never ran
+                    # ``_reset_idx``, so history, prev_action, command, reward
+                    # sums, and the scene still carry SETTLING context. Force
+                    # a reset so the upcoming LIVE episode starts clean. The
+                    # log-dict writes land in a fresh ``extras["log"]`` the
+                    # runner no longer reads, dropping SETTLING-phase sums.
+                    with torch.inference_mode():
+                        self.env.unwrapped._reset_idx(giveup_ids)
+                    state_was_written = True
                     self.env_mode[giveup_ids] = MODE_LIVE
                     self.settle_remaining[giveup_ids] = 0
                     self.settle_retries[giveup_ids] = 0
                     self._live_episodes_since_settle[giveup_ids] = 0
+                    self._reset_student_rnn(giveup_ids)
+                    cur_reward_sum[giveup_ids] = 0.0
+                    cur_episode_length[giveup_ids] = 0.0
 
-        # ---- (6,7) LIVE dones: K-episode pinning or fresh-proposal flip.
+        # (6,7) LIVE dones: K-pin or fresh-proposal flip.
         live_done = live_mask & dones_bool
         if live_done.any():
             ids = live_done.nonzero(as_tuple=False).squeeze(-1)
@@ -526,8 +541,7 @@ class MultiAgentRunner:
                 if bool(self._pending_teacher[eid].item()):
                     self._live_episodes_since_settle[eid] += 1
                     if int(self._live_episodes_since_settle[eid].item()) < self.regret_k:
-                        # Keep the env on the validated start state for
-                        # another LIVE episode.
+                        # K-pin: re-apply same pre-success state.
                         if self._pre_success_state is not None:
                             self._write_state_to_sim(
                                 self._pre_success_state,
@@ -536,15 +550,12 @@ class MultiAgentRunner:
                             state_was_written = True
                     else:
                         returns = self._per_env_live_returns[eid][:self.regret_k]
-                        max_batch_returns = max(returns)
-                        mean_batch_returns = sum(returns) / self.regret_k
-                        regret = max_batch_returns - mean_batch_returns
-                        self._iter_commit_stats["regret"].append(regret)
-                        self._iter_commit_stats["max_batch_returns"].append(max_batch_returns)
-                        self._iter_commit_stats["mean_batch_returns"].append(mean_batch_returns)
+                        regret = max(returns) - sum(returns) / self.regret_k
                         gen_r = float(self._pending_gen_reward[eid].item())
                         combined = self.beta_gen_reward * gen_r + regret
-                        self._commit_teacher(env_id=eid, gen_reward=gen_r, combined_reward=combined)
+                        self._commit_teacher(
+                            env_id=eid, gen_reward=gen_r, combined_reward=combined, regret=regret,
+                        )
                         self.env_mode[eid] = MODE_SETTLING
                         self.settle_remaining[eid] = self.inline.settle_max_steps
                         self.settle_retries[eid] = 0
@@ -556,8 +567,7 @@ class MultiAgentRunner:
                         self._sample_adversary_capture(obs, env_indices=single_id)
                         self._pending_teacher[eid] = True
                 else:
-                    # Bootstrap LIVE-done (no prior proposal, or just forced-LIVE):
-                    # flip to SETTLING and sample a fresh adversary proposal.
+                    # Bootstrap / post-giveup LIVE done → flip SETTLING w/ fresh proposal.
                     self.env_mode[eid] = MODE_SETTLING
                     self.settle_remaining[eid] = self.inline.settle_max_steps
                     self.settle_retries[eid] = 0
@@ -575,6 +585,20 @@ class MultiAgentRunner:
             "rl", num_envs=n, num_transitions_per_env=1,
             obs=obs_spec, actions_shape=[self.adversary_action_dim],
         )
+
+    def _reset_student_rnn(self, env_ids: torch.Tensor) -> None:
+        """Inject a synthetic done to clear the student actor/critic RNN
+        hidden state for ``env_ids``. Needed at SETTLING transitions that
+        don't naturally emit a done (``timed_out_no_done`` giveup, retry),
+        so SETTLING-conditioned hidden state never feeds a LIVE forward
+        pass. No-op for feedforward policies and for empty ``env_ids``."""
+        if env_ids.numel() == 0:
+            return
+        if not getattr(self.alg.policy, "is_recurrent", False):
+            return
+        synthetic = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+        synthetic[env_ids] = 1.0
+        self.alg.policy.reset(synthetic)
 
     # =====================================================================
     # Main training loop
@@ -601,28 +625,48 @@ class MultiAgentRunner:
             self.alg.broadcast_parameters()
             self.alg_adversary.broadcast_parameters()
 
-        # Term indices + manager handle are resolved once; cached on the instance.
         success_idx = self._resolve_success_term_idx()
         unwrapped_env = self.env.unwrapped
         term_mgr_handle = unwrapped_env.termination_manager
 
-        # Optional handle for the task_command term — used to override the
-        # alignment metrics with LIVE-only versions before they're logged.
+        # task_command term handle for LIVE-only alignment metric override.
         try:
             command_term_handle = unwrapped_env.command_manager.get_term("task_command")
         except (AttributeError, KeyError):
             command_term_handle = None
 
-        # Allocate adversary scratch up-front so per-env resample calls
-        # inside _step_modes can index into it without reallocating.
+        # Allocate adversary scratch so per-env resamples can index without reallocating.
+        self._sample_adversary_capture(obs, env_indices=None)
+
+        # Bootstrap: prime the action buffer + force time_out so env construction's
+        # zero-action default gets replaced by an adversary-shaped reset.
+        max_ep_len = int(self.env.max_episode_length)
+        settle_start_len = max(0, max_ep_len - self.inline.settle_max_steps)
+        student_zero = torch.zeros(
+            self.env.num_envs, self.policy_action_dim, device=self.env.device
+        )
+        prime_actions = torch.cat(
+            [student_zero, self._scratch_adv_action.to(self.env.device)], dim=-1
+        )
+        with torch.inference_mode():
+            self.env.episode_length_buf.fill_(max_ep_len)
+        obs, _, _, _ = self.env.step(prime_actions)
+        obs = obs.to(self.device)
+
+        self.env_mode.fill_(MODE_SETTLING)
+        self.settle_remaining.fill_(self.inline.settle_max_steps)
+        self.settle_retries.zero_()
+        self._pending_teacher.fill_(True)
+        with torch.inference_mode():
+            self.env.episode_length_buf.fill_(settle_start_len)
+
+        # Refresh scratch with a fresh proposal conditioned on the new obs.
         self._sample_adversary_capture(obs, env_indices=None)
 
         start_iter = self.current_learning_iteration
         tot_iter = start_iter + num_learning_iterations
 
-        # Zero template for the adversary slice of the action vector: LIVE
-        # envs keep the zeros; SETTLING envs overwrite their row with the
-        # scratch adversary action inside the rollout loop.
+        # Zero template for adversary slice; SETTLING rows overwrite with scratch.
         adv_action_zero_template = torch.zeros(
             (self.env.num_envs, self.adversary_action_dim), device=self.device
         )
@@ -637,12 +681,11 @@ class MultiAgentRunner:
                     settling_mask = (self.env_mode == MODE_SETTLING)
                     live_mask = ~settling_mask
 
-                    # Student slice: zero on SETTLING, policy action on LIVE.
+                    # Student: zero on SETTLING; adversary: zero on LIVE.
                     student_actions = policy_actions.clone()
                     if settling_mask.any():
                         student_actions[settling_mask] = 0.0
 
-                    # Adversary slice: zero on LIVE, scratch action on SETTLING.
                     adv_slice = adv_action_zero_template
                     if settling_mask.any():
                         adv_slice = adv_action_zero_template.clone()
@@ -653,10 +696,7 @@ class MultiAgentRunner:
                     valid_mask = live_mask.float().unsqueeze(-1)
                     scene_state_pre = unwrapped_env.scene.get_state(is_relative=True)
 
-                    # Tell the task_command term which rows are LIVE this
-                    # step — its `_update_metrics` and `reset` will skip
-                    # SETTLING rows so Isaac's `Metrics/task_command/*`
-                    # emits clean protagonist-only means.
+                    # LIVE-only alignment metrics (see commands.py _live_mask).
                     if command_term_handle is not None:
                         command_term_handle._live_mask.copy_(
                             live_mask.to(command_term_handle._live_mask.device)
@@ -669,22 +709,34 @@ class MultiAgentRunner:
 
                     self.alg.process_env_step(obs, rewards, dones, extras, valid_mask=valid_mask)
 
-                    # Tick settle timers on SETTLING envs.
                     settling_mask_now = (self.env_mode == MODE_SETTLING)
                     if settling_mask_now.any():
                         self.settle_remaining[settling_mask_now] = torch.clamp(
                             self.settle_remaining[settling_mask_now] - 1, min=0
                         )
 
-                    if self.log_dir is not None and dones.any():
+                    # Only bank episode-info dicts when at least one LIVE env
+                    # terminated this step. ``extras["log"]``/``"episode"`` is
+                    # one dict per step aggregated over all resets, so this
+                    # still includes SETTLING-reset contributions when both
+                    # modes reset simultaneously; cleaner per-env filtering
+                    # would need env-side support.
+                    dones_bool = dones.to(torch.bool).view(-1)
+                    live_dones = dones_bool & live_mask
+                    if self.log_dir is not None and live_dones.any():
                         if "episode" in extras:
                             ep_infos.append(extras["episode"])
                         elif "log" in extras:
                             ep_infos.append(extras["log"])
 
                     done_ids = (dones > 0).nonzero(as_tuple=False)
-                    cur_reward_sum += rewards
-                    cur_episode_length += 1
+                    # LIVE-only accumulation: SETTLING rewards must not
+                    # contribute to LIVE episode returns. Counters are also
+                    # zeroed in ``_step_modes`` on SETTLING→LIVE transitions
+                    # that don't emit a ``done`` here.
+                    live_mask_float = live_mask.to(cur_reward_sum.dtype)
+                    cur_reward_sum += rewards * live_mask_float
+                    cur_episode_length += live_mask_float
 
                 if done_ids.numel() > 0:
                     done_env_indices = done_ids[:, 0]
@@ -695,11 +747,7 @@ class MultiAgentRunner:
                     ep_returns_list = ep_returns.cpu().numpy().tolist()
                     cur_lens_list = cur_lens.cpu().numpy().tolist()
 
-                    # Bank LIVE-mode episode returns into the per-env regret
-                    # ring before mode resolution rotates this env. Only LIVE
-                    # returns feed both rewbuffer and _per_env_live_returns —
-                    # SETTLING returns (adversary-driven) are not the
-                    # protagonist's responsibility.
+                    # Bank LIVE returns only (SETTLING is adversary-driven).
                     counted_rets: list[float] = []
                     counted_lens: list[float] = []
                     for env_idx, ret, ep_len in zip(done_env_list, ep_returns_list, cur_lens_list):
@@ -716,7 +764,6 @@ class MultiAgentRunner:
                     cur_reward_sum[done_ids] = 0
                     cur_episode_length[done_ids] = 0
 
-                # Mode transitions AFTER all per-step bookkeeping.
                 state_was_written = self._step_modes(
                     dones=dones,
                     term_mgr=term_mgr_handle,
@@ -724,6 +771,8 @@ class MultiAgentRunner:
                     scene_state_pre=scene_state_pre,
                     rewards=rewards,
                     obs=obs,
+                    cur_reward_sum=cur_reward_sum,
+                    cur_episode_length=cur_episode_length,
                 )
                 if state_was_written:
                     obs = self.env.get_observations().to(self.device)
@@ -735,8 +784,6 @@ class MultiAgentRunner:
                 self.alg.compute_returns(obs)
             loss_dict = self.alg.update()
 
-            # Drain the teacher ring into an adversary update when every rank
-            # has enough commits (MIN-sync inside _maybe_fire_adversary_update).
             self._maybe_fire_adversary_update(last_obs=obs)
 
             learn_time = time.time() - learn_start

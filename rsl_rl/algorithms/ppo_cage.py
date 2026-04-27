@@ -180,10 +180,16 @@ class PPO:
         extras: dict[str, torch.Tensor],
         valid_mask: torch.Tensor | None = None,
     ) -> None:
-        # Update the normalizers
-        self.policy.update_normalization(obs)
-        if self.rnd:
-            self.rnd.update_normalization(obs)
+        # Update the normalizers on LIVE rows only — SETTLING obs are
+        # adversary-driven and would bias the running mean/std.
+        norm_obs = obs
+        if valid_mask is not None and not bool((valid_mask == 1.0).all().item()):
+            live_idx = valid_mask.view(-1).nonzero(as_tuple=False).squeeze(-1)
+            norm_obs = obs[live_idx] if live_idx.numel() > 0 else None
+        if norm_obs is not None:
+            self.policy.update_normalization(norm_obs)
+            if self.rnd:
+                self.rnd.update_normalization(norm_obs)
 
         # Record the rewards and dones
         # Note: We clone here because later on we bootstrap the rewards based on timeouts
