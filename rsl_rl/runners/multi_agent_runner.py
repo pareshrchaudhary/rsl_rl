@@ -9,6 +9,7 @@ import os
 import time
 import torch
 import warnings
+import h5py
 from collections import deque
 from dataclasses import dataclass
 from tensordict import TensorDict
@@ -27,16 +28,12 @@ MODE_SETTLING = 1
 
 @dataclass
 class InlineSettlingConfig:
-    """Production parameters for inline settling."""
     settle_max_steps: int = 20               # 2.0s window at 0.1s control step
     invalid_settle_penalty: float = -1.0     # reward for a forced-LIVE teacher tuple
     max_resample_retries: int = 5            # per-env settle attempts before giving up
     adversary_update_batch_size: int | None = None  # None ⇒ num_envs (per-rank)
     settling_gripper_default_action: float = -1.0
-    # When True: no SETTLING/LIVE state machine. Envs stay LIVE; one
-    # teacher tuple per done with combined_reward = -ep_return. No K-pin,
-    # no ``success`` termination required. For parameter-only adversaries
-    # whose proposals don't need a stability/validity gate.
+    # Parameter-only adversary: no SETTLING/LIVE gate or K-pin.
     skip_settling: bool = False
 
     @classmethod
@@ -46,7 +43,7 @@ class InlineSettlingConfig:
 
 
 class MultiAgentRunner:
-    """Continuous per-env LIVE/SETTLING loop with masked PPO + rolling adversary updates."""
+    """PPO student plus reset-state adversary."""
 
     def __init__(self, env: VecEnv, train_cfg: dict, log_dir: str | None = None, device: str = "cpu") -> None:
         self.cfg = train_cfg
@@ -63,17 +60,10 @@ class MultiAgentRunner:
 
         self.num_steps_per_env = self.cfg["num_steps_per_env"]
         self.save_interval = self.cfg["save_interval"]
+        self.record_parameters = self.cfg.get("record_parameters", False)
 
-        # Student drives the head, adversary the tail of the concat action.
         self.adversary_action_dim = self.cfg["adversary_robot_parameters"]
         self.policy_action_dim = int(self.env.num_actions - self.adversary_action_dim)
-
-        self._adversary_context_dim = 36
-        self._adversary_settled_policy_obs = torch.zeros(
-            (self.env.num_envs, self._adversary_context_dim), dtype=torch.float, device=self.env.device
-        )
-        unwrapped_env = getattr(self.env, "unwrapped", self.env)
-        setattr(unwrapped_env, "_cage_adversary_settled_policy_observation", self._adversary_settled_policy_obs)
 
         obs = self.env.get_observations()
 
@@ -84,7 +74,6 @@ class MultiAgentRunner:
             adversary_obs_groups_raw["critic"] = list(adversary_obs_groups_raw.get("policy", []))
         self.adversary_obs_groups = resolve_obs_groups(obs, adversary_obs_groups_raw, ["critic"])
 
-        # IPPO: independent PPO for protagonist; Reinforce bandit for adversary.
         self.alg = self._construct_agent_algorithm(
             obs=obs,
             obs_groups=self.cfg["obs_groups"],
@@ -110,6 +99,7 @@ class MultiAgentRunner:
         self.tot_time = 0
         self.current_learning_iteration = 0
         self.git_status_repos: list[str] = [str(rsl_rl.__file__)]
+        self.adversary_parameter_names = self.cfg.get("adversary_parameter_names", [])
 
         self.beta_gen_reward = float(self.cfg.get("beta_gen_reward", 1.0))
         self.adversary_kl_penalty_coef = float(self.cfg.get("adversary_kl_penalty_coef", 0.0))
@@ -118,27 +108,22 @@ class MultiAgentRunner:
 
         self.inline = InlineSettlingConfig.from_cfg(self.cfg)
 
-        # Per-env mode + settle bookkeeping.
         n = self.env.num_envs
         self.env_mode = torch.full((n,), MODE_LIVE, dtype=torch.uint8, device=self.device)
         self.settle_remaining = torch.zeros(n, dtype=torch.int32, device=self.device)
         self.settle_retries = torch.zeros(n, dtype=torch.int32, device=self.device)
         self._pending_adversary_context_ids = torch.empty(0, dtype=torch.long, device=self.device)
-        # Pre-success snapshot + proposal gen_reward (lazy-allocated on first stash).
         self._pre_success_state: dict | None = None
         self._pending_teacher = torch.zeros(n, dtype=torch.bool, device=self.device)
         self._pending_gen_reward = torch.zeros(n, dtype=torch.float, device=self.device)
-        # K-episode pinning state.
         self._live_episodes_since_settle = torch.zeros(n, dtype=torch.int32, device=self.device)
         self._per_env_live_returns: list[list[float]] = [[] for _ in range(n)]
-        # Teacher commit ring: drained once every rank has target tuples.
-        # ``regret`` is None for giveup entries so update-time logging can
-        # restrict the regret mean to K-pin entries.
         self._teacher_commit: dict[str, list] = {
             "obs": [], "action": [], "log_prob": [], "mu": [], "sigma": [],
             "gen_reward": [], "reward": [], "regret": [],
         }
-        # Latest adversary-update snapshot; emitted per-iter under ``Adversary/*``.
+        self._recorded_adversary_params: list[torch.Tensor] = []
+        self._recorded_adversary_param_dim: int | None = None
         self._inline_last_adv_loss: dict[str, float] = {}
         self._inline_last_adv_rewards: dict[str, float] = {}
 
@@ -146,17 +131,56 @@ class MultiAgentRunner:
 
         self._install_live_filtered_reward_logging()
 
-    # =====================================================================
-    # LIVE-only reward-log filtering
-    # =====================================================================
+    # Logging
+
+    def _prepare_adversary_param_h5(self) -> str | None:
+        if self.log_dir is None or not self.record_parameters:
+            return None
+        path = os.path.join(self.log_dir, "raw_params.h5")
+        if not self.disable_logs and not os.path.exists(path):
+            with h5py.File(path, "w") as f:
+                f.attrs["param_names"] = [n.encode("utf-8") for n in self.adversary_parameter_names]
+        return path
+
+    def _record_adversary_params(self, action: torch.Tensor, env_indices: torch.Tensor | None) -> None:
+        if not self.record_parameters:
+            return
+        rows = action if env_indices is None else action[env_indices]
+        rows = rows.detach().clone()
+        self._recorded_adversary_param_dim = int(rows.shape[-1])
+        self._recorded_adversary_params.append(rows)
+
+    def _collect_adversary_params(self) -> torch.Tensor | None:
+        if not self.record_parameters:
+            return None
+        if self._recorded_adversary_params:
+            local = torch.cat(self._recorded_adversary_params, dim=0).cpu()
+            self._recorded_adversary_params.clear()
+        elif self._recorded_adversary_param_dim is not None:
+            local = torch.empty((0, self._recorded_adversary_param_dim), dtype=torch.float32)
+        else:
+            return None
+
+        if not self.is_distributed:
+            return local if local.numel() > 0 else None
+
+        gathered: list[torch.Tensor | None] = [None for _ in range(self.gpu_world_size)]
+        torch.distributed.all_gather_object(gathered, local)
+        if self.gpu_global_rank != 0:
+            return None
+        non_empty = [t for t in gathered if isinstance(t, torch.Tensor) and t.numel() > 0]
+        return torch.cat(non_empty, dim=0) if non_empty else None
+
+    def _write_adversary_params(self, path: str | None, it: int, params: torch.Tensor | None) -> None:
+        if path is None or params is None or self.disable_logs:
+            return
+        with h5py.File(path, "a") as f:
+            group = f.create_group(f"iteration_{it}")
+            group.create_dataset("raw_params", data=params.numpy())
+            group.attrs["num_samples"] = params.shape[0]
 
     def _install_live_filtered_reward_logging(self) -> None:
-        """Swap ``RewardManager.reset`` for a LIVE-filtered version so
-        ``Episode_Reward/<term>`` scalars reflect LIVE episodes only.
-        SETTLING resets still zero ``_episode_sums`` for bookkeeping; we
-        just exclude them from the mean the logger sees. Mirrors the
-        pattern ``TaskCommand.reset`` uses for its metrics.
-        """
+        """Filter reward logs to LIVE episodes."""
         reward_mgr = self.env.unwrapped.reward_manager
         env_mode = self.env_mode
 
@@ -182,25 +206,7 @@ class MultiAgentRunner:
 
         reward_mgr.reset = reset
 
-    # =====================================================================
-    # Adversary sampling + manual transition population
-    # =====================================================================
-
-    def _capture_settled_policy_observation(self, obs, env_indices: torch.Tensor) -> None:
-        if env_indices.numel() == 0:
-            return
-        critic_obs = obs["critic"].detach().to(self._adversary_settled_policy_obs.device)
-        if critic_obs.shape[-1] < 43:
-            raise RuntimeError(
-                f"Critic observation has dim {critic_obs.shape[-1]}, expected at least 43."
-            )
-        # Critic prefix layout: insertive-in-receptive(6), prev_actions(7),
-        # joint_pos(12), ee_pose(6), insertive_pose(6), receptive_pose(6).
-        # The reset adversary should condition on state hardness, not the
-        # protagonist's previous action, so drop the 7D prev_actions block.
-        settled_context = torch.cat((critic_obs[:, 0:6], critic_obs[:, 13:43]), dim=-1)
-        env_ids = env_indices.to(self._adversary_settled_policy_obs.device)
-        self._adversary_settled_policy_obs[env_ids] = settled_context[env_ids]
+    # Adversary sampling
 
     def _update_adversary_previous_action_obs(self, action: torch.Tensor, env_indices: torch.Tensor | None) -> None:
         action_term = getattr(getattr(self.env, "unwrapped", self.env).action_manager, "_terms", {}).get("adversaryaction")
@@ -211,8 +217,7 @@ class MultiAgentRunner:
     def _sample_adversary_capture(
         self, obs, env_indices: torch.Tensor | None = None
     ) -> torch.Tensor:
-        """Sample adversary actions and snapshot (obs, action, log_prob, mu, sigma)
-        into per-env scratch. ``env_indices=None`` refreshes all rows."""
+        """Sample adversary actions into per-env scratch."""
         with torch.inference_mode():
             action = self.alg_adversary.policy.act(obs).detach()
             log_prob = self.alg_adversary.policy.get_actions_log_prob(action).detach()
@@ -239,13 +244,13 @@ class MultiAgentRunner:
             self._scratch_adv_sigma[env_indices] = sigma[env_indices]
 
         self._update_adversary_previous_action_obs(action, env_indices)
+        self._record_adversary_params(action, env_indices)
         return action
 
     def _adversary_update_from_tuples(
         self, tuples: dict, rewards: torch.Tensor, last_obs
     ) -> dict:
-        """Reinforce update using log_prob/mu/sigma stashed at action-time so
-        the ratio is honest for samples drawn under π_{n-1}."""
+        """Run one adversary update from stashed action-time tuples."""
         alg = self.alg_adversary
         n = tuples["action"].shape[0]
 
@@ -276,12 +281,9 @@ class MultiAgentRunner:
         self._success_term_idx = idx
         return idx
 
-    # =====================================================================
-    # Teacher commit ring + rolling adversary update
-    # =====================================================================
+    # Adversary updates
 
     def _snapshot_teacher_tuple(self, env_ids: torch.Tensor) -> dict:
-        """Extract the adversary scratch slots for ``env_ids`` as detached clones."""
         return {
             "obs": {k: v[env_ids].detach().clone() for k, v in self._scratch_adv_obs.items()},
             "action": self._scratch_adv_action[env_ids].detach().clone(),
@@ -297,7 +299,6 @@ class MultiAgentRunner:
         combined_reward: float,
         regret: float | None = None,
     ) -> None:
-        """Append one teacher tuple to the ring and clear the pending flag."""
         idx_t = torch.tensor([env_id], dtype=torch.long, device=self.device)
         tup = self._snapshot_teacher_tuple(idx_t)
         self._teacher_commit["obs"].append(tup["obs"])
@@ -316,9 +317,7 @@ class MultiAgentRunner:
         return int(bs) if bs is not None else self.env.num_envs
 
     def _maybe_fire_adversary_update(self, last_obs) -> dict | None:
-        """Drain the ring into an adversary PPO update when every rank has
-        target tuples. MIN-syncs readiness across ranks to avoid an NCCL
-        all_reduce deadlock inside ``alg.update()``."""
+        """Update adversary once every rank has enough tuples."""
         target = self._teacher_batch_size_target()
         local_ready = int(len(self._teacher_commit["reward"]) >= target)
         if self.is_distributed:
@@ -368,34 +367,41 @@ class MultiAgentRunner:
         return loss_dict
 
     def _emit_inline_iter_metrics(self, writer, it: int) -> None:
-        """Emit the latest adversary-update snapshot under ``Adversary/*``.
-        Values plateau between updates (ring-fill cadence) and refresh on
-        each ``_maybe_fire_adversary_update`` that actually fires."""
         if writer is not None:
             for k, v in self._inline_last_adv_loss.items():
                 writer.add_scalar(f"Adversary/{k}", v, it)
             for k, v in self._inline_last_adv_rewards.items():
                 writer.add_scalar(f"Adversary/{k}", v, it)
 
-    def _settling_gripper_targets(self, unwrapped_env) -> torch.Tensor:
-        default = torch.full(
+    def _multi_agent_env_hooks(self):
+        return getattr(self.env.unwrapped, "_multi_agent_runner_hooks", None)
+
+    def _call_multi_agent_env_hook(self, hook_name: str, *args, default=None, **kwargs):
+        hooks = self._multi_agent_env_hooks()
+        hook = getattr(hooks, hook_name, None)
+        if not callable(hook):
+            return default
+        return hook(*args, **kwargs)
+
+    def _settling_gripper_targets(self) -> torch.Tensor:
+        target = self._call_multi_agent_env_hook(
+            "settling_gripper_targets",
+            float(self.inline.settling_gripper_default_action),
+            default=None,
+        )
+        if isinstance(target, torch.Tensor) and target.numel() == self.env.num_envs:
+            return target.to(self.device, dtype=torch.float).view(-1)
+        return torch.full(
             (self.env.num_envs,),
             float(self.inline.settling_gripper_default_action),
             dtype=torch.float,
             device=self.device,
         )
-        target = getattr(unwrapped_env, "_cage_adversary_gripper_action_target", None)
-        if not isinstance(target, torch.Tensor) or target.numel() != self.env.num_envs:
-            return default
-        return target.to(self.device, dtype=torch.float).view(-1)
 
-    # =====================================================================
-    # Pre-success state capture + restore
-    # =====================================================================
+    # State restore
 
     def _write_state_to_sim(self, state: dict, env_ids: torch.Tensor) -> None:
-        """Restore saved scene state for ``env_ids`` (articulation + rigid
-        objects, env-relative xyz rebased with ``env_origins``)."""
+        """Restore saved scene state."""
         if env_ids.numel() == 0:
             return
         scene = self.env.unwrapped.scene
@@ -430,9 +436,6 @@ class MultiAgentRunner:
                             fields["root_velocity"][env_ids].clone(), env_ids=env_ids
                         )
             scene.write_data_to_sim()
-            # Obs history was first-pushed with the post-reset random obs
-            # before we overwrote the scene; clear it + prev_action so the
-            # next step repopulates from the restored state.
             env_unwrapped = self.env.unwrapped
             for group_buffers in env_unwrapped.observation_manager._group_obs_term_history_buffer.values():
                 for circular_buffer in group_buffers.values():
@@ -440,7 +443,6 @@ class MultiAgentRunner:
             env_unwrapped.action_manager._prev_action[env_ids] = 0.0
 
     def _stash_pre_success_for(self, state: dict, env_ids: torch.Tensor) -> None:
-        """Write per-env slice of ``state`` into ``_pre_success_state`` (lazy-alloc)."""
         if env_ids.numel() == 0:
             return
         if self._pre_success_state is None:
@@ -456,36 +458,25 @@ class MultiAgentRunner:
                 for k, v in fields.items():
                     self._pre_success_state[category][asset_name][k][env_ids] = v[env_ids].clone()
 
-    # =====================================================================
-    # Per-step mode transitions
-    # =====================================================================
+    # Mode transitions
 
     def _step_modes_no_settling(
         self,
         dones: torch.Tensor,
         obs: TensorDict,
     ) -> bool:
-        """Skip-settling K-pin regret. Mirrors the AdversaryBase mechanism
-        translated to dataset-loaded resets: at the first done after each
-        resample (transition done where reset_idx applies the new adversary
-        action), capture the post-reset state as the anchor. Re-pin that
-        anchor for the next K replays, then commit
-        ``regret = max(returns) - mean(returns)``, resample, and repeat.
-        ``gen_reward`` is unused in this mode (no SETTLING success step)."""
+        """K-pin regret without SETTLING validation."""
         state_was_written = False
         dones_bool = dones.to(torch.bool).view(-1)
         if not dones_bool.any():
             return state_was_written
         done_ids = dones_bool.nonzero(as_tuple=False).squeeze(-1)
 
-        # Post-step scene state: reflects any reset_idx writes from this step.
         post_reset_state = self.env.unwrapped.scene.get_state(is_relative=True)
 
         for eid in done_ids.tolist():
             single_id = torch.tensor([eid], device=self.device, dtype=torch.long)
             if not bool(self._pending_teacher[eid].item()):
-                # Transition done: anchor on post-reset state under the new
-                # adversary action; drop this return (still under old action).
                 self._stash_pre_success_for(post_reset_state, single_id)
                 self._pending_teacher[eid] = True
                 self._live_episodes_since_settle[eid] = 0
@@ -495,7 +486,6 @@ class MultiAgentRunner:
             self._live_episodes_since_settle[eid] += 1
             count = int(self._live_episodes_since_settle[eid].item())
             if count < self.regret_k:
-                # K-pin: re-write anchor so the next replay starts identically.
                 if self._pre_success_state is not None:
                     self._write_state_to_sim(self._pre_success_state, single_id)
                     state_was_written = True
@@ -506,8 +496,6 @@ class MultiAgentRunner:
                 self._commit_teacher(
                     env_id=eid, gen_reward=0.0, combined_reward=combined, regret=regret,
                 )
-                # ``_commit_teacher`` flips ``_pending_teacher`` False so the
-                # next done is treated as the new cycle's transition.
                 self._live_episodes_since_settle[eid] = 0
                 self._per_env_live_returns[eid] = []
                 self._sample_adversary_capture(obs, env_indices=single_id)
@@ -525,25 +513,7 @@ class MultiAgentRunner:
         cur_reward_sum: torch.Tensor,
         cur_episode_length: torch.Tensor,
     ) -> bool:
-        """Resolve per-env mode transitions after a sim-step.
-
-        1. SETTLING success → stash pre-step state + gen_reward.
-        2. SETTLING done = resolution. Success → valid; else invalid.
-        3. Valid → restore pre-success state, flip LIVE.
-        4. Invalid + retries left → push ``episode_length_buf`` for another
-           time_out ``settle_max_steps`` later; resample adversary.
-        5. Invalid + retries exhausted → commit with penalty, force LIVE.
-        6. LIVE done + pending teacher: if < ``regret_k`` replays, re-apply
-           pre-success (K-pin); else compute regret, commit, flip SETTLING.
-        7. LIVE done w/o pending teacher → flip SETTLING w/ fresh proposal.
-
-        ``cur_reward_sum`` and ``cur_episode_length`` are the caller's
-        per-env LIVE-return accumulators. They are zeroed on every
-        SETTLING→LIVE transition (valid and giveup) so accumulated
-        SETTLING-phase values never carry into LIVE banking.
-
-        Returns True iff sim state was written (caller must refresh ``obs``).
-        """
+        """Resolve LIVE/SETTLING transitions."""
         state_was_written = False
         max_ep_len = int(self.env.max_episode_length)
         settle_start = max(0, max_ep_len - self.inline.settle_max_steps)
@@ -552,7 +522,6 @@ class MultiAgentRunner:
         live_mask = ~settling_mask
         dones_bool = dones.to(torch.bool).view(-1)
 
-        # (1) Stash pre-success state.
         success_this_step = term_mgr._last_episode_dones[:, success_idx].to(torch.bool) & dones_bool
         success_in_settle = success_this_step & settling_mask
         if success_in_settle.any():
@@ -560,7 +529,6 @@ class MultiAgentRunner:
             self._stash_pre_success_for(scene_state_pre, success_ids)
             self._pending_gen_reward[success_ids] = rewards[success_ids].view(-1).float()
 
-        # (2) Resolve SETTLING dones / timer expirations.
         done_settling = settling_mask & dones_bool
         timed_out_no_done = settling_mask & (self.settle_remaining == 0) & ~dones_bool
         resolved = done_settling | timed_out_no_done
@@ -569,7 +537,6 @@ class MultiAgentRunner:
             valid = resolved & success_in_settle
             invalid = resolved & ~valid
 
-            # (3) Valid → LIVE on pre-success state.
             if valid.any():
                 valid_ids = valid.nonzero(as_tuple=False).squeeze(-1)
                 if self._pre_success_state is not None:
@@ -580,19 +547,13 @@ class MultiAgentRunner:
                 self.settle_remaining[valid_ids] = 0
                 self.settle_retries[valid_ids] = 0
                 self._live_episodes_since_settle[valid_ids] = 0
+                self._call_multi_agent_env_hook("on_live_anchor_start", valid_ids.to(self.env.device))
                 for eid in valid_ids.tolist():
                     self._per_env_live_returns[eid] = []
-                # Fresh LIVE episode on restored state: clear RNN hidden
-                # state and the LIVE-return accumulator so nothing from the
-                # SETTLING window (or any prior attempt) leaks in. Valid
-                # envs had dones=True so ``policy.reset(dones)`` already
-                # fired in ``process_env_step``; we re-assert here to keep
-                # the invariant mode-change-site-local.
                 self._reset_student_rnn(valid_ids)
                 cur_reward_sum[valid_ids] = 0.0
                 cur_episode_length[valid_ids] = 0.0
 
-            # (4,5) Invalid → retry or forced-LIVE.
             if invalid.any():
                 invalid_ids = invalid.nonzero(as_tuple=False).squeeze(-1)
                 can_retry = self.settle_retries[invalid_ids] < self.inline.max_resample_retries
@@ -605,10 +566,6 @@ class MultiAgentRunner:
                     self.settle_remaining[retry_ids] = self.inline.settle_max_steps
                     self.settle_retries[retry_ids] += 1
                     self._sample_adversary_capture(obs, env_indices=retry_ids)
-                    # ``timed_out_no_done`` retries never saw a ``done``, so
-                    # ``policy.reset(dones)`` didn't clear their RNN. Clear
-                    # explicitly so the new SETTLING attempt starts fresh
-                    # (no-op for retries that did see a done).
                     self._reset_student_rnn(retry_ids)
 
                 if giveup_ids.numel() > 0:
@@ -619,12 +576,6 @@ class MultiAgentRunner:
                                 gen_reward=float(self._pending_gen_reward[eid].item()),
                                 combined_reward=self.inline.invalid_settle_penalty,
                             )
-                    # Giveup fires on ``timed_out_no_done`` — Isaac never ran
-                    # ``_reset_idx``, so history, prev_action, command, reward
-                    # sums, and the scene still carry SETTLING context. Force
-                    # a reset so the upcoming LIVE episode starts clean. The
-                    # log-dict writes land in a fresh ``extras["log"]`` the
-                    # runner no longer reads, dropping SETTLING-phase sums.
                     with torch.inference_mode():
                         self.env.unwrapped._reset_idx(giveup_ids)
                     state_was_written = True
@@ -632,11 +583,11 @@ class MultiAgentRunner:
                     self.settle_remaining[giveup_ids] = 0
                     self.settle_retries[giveup_ids] = 0
                     self._live_episodes_since_settle[giveup_ids] = 0
+                    self._call_multi_agent_env_hook("on_live_anchor_start", giveup_ids.to(self.env.device))
                     self._reset_student_rnn(giveup_ids)
                     cur_reward_sum[giveup_ids] = 0.0
                     cur_episode_length[giveup_ids] = 0.0
 
-        # (6,7) LIVE dones: K-pin or fresh-proposal flip.
         live_done = live_mask & dones_bool
         if live_done.any():
             ids = live_done.nonzero(as_tuple=False).squeeze(-1)
@@ -644,7 +595,6 @@ class MultiAgentRunner:
                 if bool(self._pending_teacher[eid].item()):
                     self._live_episodes_since_settle[eid] += 1
                     if int(self._live_episodes_since_settle[eid].item()) < self.regret_k:
-                        # K-pin: re-apply same pre-success state.
                         if self._pre_success_state is not None:
                             self._write_state_to_sim(
                                 self._pre_success_state,
@@ -659,25 +609,26 @@ class MultiAgentRunner:
                         self._commit_teacher(
                             env_id=eid, gen_reward=gen_r, combined_reward=combined, regret=regret,
                         )
+                        single_id = torch.tensor([eid], device=self.device, dtype=torch.long)
                         self.env_mode[eid] = MODE_SETTLING
+                        self._call_multi_agent_env_hook("on_live_anchor_clear", single_id.to(self.env.device))
                         self.settle_remaining[eid] = self.inline.settle_max_steps
                         self.settle_retries[eid] = 0
                         self._live_episodes_since_settle[eid] = 0
                         self._per_env_live_returns[eid] = []
                         with torch.inference_mode():
                             self.env.episode_length_buf[eid] = settle_start
-                        single_id = torch.tensor([eid], device=self.device, dtype=torch.long)
                         self._sample_adversary_capture(obs, env_indices=single_id)
                         self._pending_teacher[eid] = True
                 else:
-                    # Bootstrap / post-giveup LIVE done → flip SETTLING w/ fresh proposal.
+                    single_id = torch.tensor([eid], device=self.device, dtype=torch.long)
                     self.env_mode[eid] = MODE_SETTLING
+                    self._call_multi_agent_env_hook("on_live_anchor_clear", single_id.to(self.env.device))
                     self.settle_remaining[eid] = self.inline.settle_max_steps
                     self.settle_retries[eid] = 0
                     self._live_episodes_since_settle[eid] = 0
                     with torch.inference_mode():
                         self.env.episode_length_buf[eid] = settle_start
-                    single_id = torch.tensor([eid], device=self.device, dtype=torch.long)
                     self._sample_adversary_capture(obs, env_indices=single_id)
                     self._pending_teacher[eid] = True
 
@@ -690,11 +641,7 @@ class MultiAgentRunner:
         )
 
     def _reset_student_rnn(self, env_ids: torch.Tensor) -> None:
-        """Inject a synthetic done to clear the student actor/critic RNN
-        hidden state for ``env_ids``. Needed at SETTLING transitions that
-        don't naturally emit a done (``timed_out_no_done`` giveup, retry),
-        so SETTLING-conditioned hidden state never feeds a LIVE forward
-        pass. No-op for feedforward policies and for empty ``env_ids``."""
+        """Clear recurrent student state for selected envs."""
         if env_ids.numel() == 0:
             return
         if not getattr(self.alg.policy, "is_recurrent", False):
@@ -703,9 +650,7 @@ class MultiAgentRunner:
         synthetic[env_ids] = 1.0
         self.alg.policy.reset(synthetic)
 
-    # =====================================================================
-    # Main training loop
-    # =====================================================================
+    # Training loop
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False) -> None:
         self._prepare_logging_writer()
@@ -732,17 +677,13 @@ class MultiAgentRunner:
         unwrapped_env = self.env.unwrapped
         term_mgr_handle = unwrapped_env.termination_manager
 
-        # task_command term handle for LIVE-only alignment metric override.
         try:
             command_term_handle = unwrapped_env.command_manager.get_term("task_command")
         except (AttributeError, KeyError):
             command_term_handle = None
 
-        # Allocate adversary scratch so per-env resamples can index without reallocating.
         self._sample_adversary_capture(obs, env_indices=None)
 
-        # Bootstrap: prime the action buffer + force time_out so env construction's
-        # zero-action default gets replaced by an adversary-shaped reset.
         max_ep_len = int(self.env.max_episode_length)
         settle_start_len = max(0, max_ep_len - self.inline.settle_max_steps)
         student_zero = torch.zeros(
@@ -764,13 +705,12 @@ class MultiAgentRunner:
             with torch.inference_mode():
                 self.env.episode_length_buf.fill_(settle_start_len)
 
-            # Refresh scratch with a fresh proposal conditioned on the new obs.
             self._sample_adversary_capture(obs, env_indices=None)
 
         start_iter = self.current_learning_iteration
         tot_iter = start_iter + num_learning_iterations
+        param_h5_path = self._prepare_adversary_param_h5()
 
-        # Zero template for adversary slice; SETTLING rows overwrite with scratch.
         adv_action_zero_template = torch.zeros(
             (self.env.num_envs, self.adversary_action_dim), device=self.device
         )
@@ -786,17 +726,14 @@ class MultiAgentRunner:
                     live_mask = ~settling_mask
 
                     if self.inline.skip_settling:
-                        # Both student and adversary actions flow every step;
-                        # adversary action only matters at the next reset event.
                         student_actions = policy_actions
                         adv_slice = self._scratch_adv_action
                     else:
-                        # Student: zero on SETTLING; adversary: zero on LIVE.
                         student_actions = policy_actions.clone()
                         if settling_mask.any():
                             student_actions[settling_mask] = 0.0
                             if self.policy_action_dim > 0:
-                                gripper_targets = self._settling_gripper_targets(unwrapped_env)
+                                gripper_targets = self._settling_gripper_targets()
                                 student_actions[settling_mask, -1] = gripper_targets[settling_mask]
 
                         adv_slice = adv_action_zero_template
@@ -806,10 +743,17 @@ class MultiAgentRunner:
 
                     actions = torch.cat([student_actions, adv_slice], dim=-1)
 
+                    if not self.inline.skip_settling and settling_mask.any():
+                        settling_ids = settling_mask.nonzero(as_tuple=False).squeeze(-1)
+                        self._call_multi_agent_env_hook(
+                            "apply_settling_state_targets",
+                            settling_ids.to(self.env.device),
+                            write_state=True,
+                        )
+
                     valid_mask = live_mask.float().unsqueeze(-1)
                     scene_state_pre = unwrapped_env.scene.get_state(is_relative=True)
 
-                    # LIVE-only alignment metrics (see commands.py _live_mask).
                     if command_term_handle is not None:
                         command_term_handle._live_mask.copy_(
                             live_mask.to(command_term_handle._live_mask.device)
@@ -828,12 +772,6 @@ class MultiAgentRunner:
                             self.settle_remaining[settling_mask_now] - 1, min=0
                         )
 
-                    # Only bank episode-info dicts when at least one LIVE env
-                    # terminated this step. ``extras["log"]``/``"episode"`` is
-                    # one dict per step aggregated over all resets, so this
-                    # still includes SETTLING-reset contributions when both
-                    # modes reset simultaneously; cleaner per-env filtering
-                    # would need env-side support.
                     dones_bool = dones.to(torch.bool).view(-1)
                     live_dones = dones_bool & live_mask
                     if self.log_dir is not None and live_dones.any():
@@ -843,10 +781,6 @@ class MultiAgentRunner:
                             ep_infos.append(extras["log"])
 
                     done_ids = (dones > 0).nonzero(as_tuple=False)
-                    # LIVE-only accumulation: SETTLING rewards must not
-                    # contribute to LIVE episode returns. Counters are also
-                    # zeroed in ``_step_modes`` on SETTLING→LIVE transitions
-                    # that don't emit a ``done`` here.
                     live_mask_float = live_mask.to(cur_reward_sum.dtype)
                     cur_reward_sum += rewards * live_mask_float
                     cur_episode_length += live_mask_float
@@ -860,7 +794,6 @@ class MultiAgentRunner:
                     ep_returns_list = ep_returns.cpu().numpy().tolist()
                     cur_lens_list = cur_lens.cpu().numpy().tolist()
 
-                    # Bank LIVE returns only (SETTLING is adversary-driven).
                     counted_rets: list[float] = []
                     counted_lens: list[float] = []
                     for env_idx, ret, ep_len in zip(done_env_list, ep_returns_list, cur_lens_list):
@@ -873,6 +806,12 @@ class MultiAgentRunner:
                     if self.log_dir is not None and counted_rets:
                         rewbuffer.extend(counted_rets)
                         lenbuffer.extend(counted_lens)
+
+                    live_done_env_indices = done_env_indices[self.env_mode[done_env_indices] == MODE_LIVE]
+                    self._call_multi_agent_env_hook(
+                        "on_live_episode_done",
+                        live_done_env_indices.to(self.env.device),
+                    )
 
                     cur_reward_sum[done_ids] = 0
                     cur_episode_length[done_ids] = 0
@@ -892,10 +831,15 @@ class MultiAgentRunner:
                     )
                 if state_was_written:
                     obs = self.env.get_observations().to(self.device)
-                    self._capture_settled_policy_observation(obs, self._pending_adversary_context_ids)
+                    self._call_multi_agent_env_hook(
+                        "capture_settled_policy_observation",
+                        obs,
+                        self._pending_adversary_context_ids.to(self.env.device),
+                    )
                     self._pending_adversary_context_ids = torch.empty(0, dtype=torch.long, device=self.device)
 
             collection_time = time.time() - collection_start
+            raw_params_cpu = self._collect_adversary_params()
 
             learn_start = time.time()
             with torch.inference_mode():
@@ -903,6 +847,11 @@ class MultiAgentRunner:
             loss_dict = self.alg.update()
 
             self._maybe_fire_adversary_update(last_obs=obs)
+            env_iter_metrics = self._call_multi_agent_env_hook(
+                "consume_iter_metrics",
+                is_distributed=self.is_distributed,
+                default={},
+            )
 
             learn_time = time.time() - learn_start
             self.current_learning_iteration = it
@@ -925,6 +874,17 @@ class MultiAgentRunner:
                     locs=locals(),
                 )
                 self._emit_inline_iter_metrics(self.writer, it)
+                for key, value in env_iter_metrics.items():
+                    self.writer.add_scalar(key, value, it)
+                env_metrics_message = self._call_multi_agent_env_hook(
+                    "format_iter_metrics",
+                    env_iter_metrics,
+                    default=None,
+                )
+                if env_metrics_message:
+                    print(env_metrics_message)
+
+                self._write_adversary_params(param_h5_path, it, raw_params_cpu)
 
                 if it % self.save_interval == 0:
                     self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
@@ -941,9 +901,7 @@ class MultiAgentRunner:
         if self.log_dir is not None and not self.disable_logs:
             self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"))
 
-    # =====================================================================
     # Save / load
-    # =====================================================================
 
     def save(self, path: str, infos: dict | None = None) -> None:
         torch.save({
@@ -1010,9 +968,7 @@ class MultiAgentRunner:
     def add_git_repo_to_log(self, repo_file_path: str) -> None:
         self.git_status_repos.append(repo_file_path)
 
-    # =====================================================================
     # Infrastructure
-    # =====================================================================
 
     def _configure_multi_gpu(self) -> None:
         self.gpu_world_size = int(os.getenv("WORLD_SIZE", "1"))
