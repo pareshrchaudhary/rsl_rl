@@ -54,10 +54,6 @@ class Reinforce:
         normalize_advantage_per_mini_batch: bool = False,
         # Baseline is an EMA of past returns; start at 0 so constant-regret rewards still learn.
         baseline_momentum: float = 0.9,
-        # KL(old || new) penalty toward the previous-cycle distribution. In the MARL
-        # adversary flow, all actions in a cycle are sampled with π_{n-1}, so
-        # old_mu/old_sigma == π_{n-1}'s distribution and this term anchors π_n to it.
-        kl_penalty_coef: float = 0.0,
         multi_gpu_cfg: dict | None = None,
         **_: object,
     ) -> None:
@@ -66,7 +62,6 @@ class Reinforce:
 
         self.clip_param = float(clip_param)
         self.entropy_coef = float(entropy_coef)
-        self.kl_penalty_coef = float(kl_penalty_coef)
         self.num_learning_epochs = int(num_learning_epochs)
         self.num_mini_batches = int(num_mini_batches)
         self.max_grad_norm = float(max_grad_norm)
@@ -163,7 +158,6 @@ class Reinforce:
         mean_surrogate_loss = 0.0
         mean_entropy = 0.0
         mean_kl = 0.0
-        mean_kl_penalty = 0.0
         num_updates = 0
         for (
             obs_batch,
@@ -214,20 +208,6 @@ class Reinforce:
 
             entropy_term = _masked_mean(entropy_batch, valid_mask_batch)
             loss = surrogate_loss - self.entropy_coef * entropy_term
-
-            kl_penalty_term = None
-            if self.kl_penalty_coef > 0.0:
-                new_mu = self.policy.action_mean
-                new_sigma = self.policy.action_std
-                kl_per_elem = torch.sum(
-                    torch.log(new_sigma / old_sigma_batch + 1.0e-5)
-                    + (torch.square(old_sigma_batch) + torch.square(old_mu_batch - new_mu))
-                    / (2.0 * torch.square(new_sigma))
-                    - 0.5,
-                    dim=-1,
-                )
-                kl_penalty_term = _masked_mean(kl_per_elem, valid_mask_batch)
-                loss = loss + self.kl_penalty_coef * kl_penalty_term
 
             self.optimizer.zero_grad()
             loss.backward()
@@ -283,8 +263,6 @@ class Reinforce:
             mean_entropy += float(entropy_term.item())
             if kl_mean is not None:
                 mean_kl += float(kl_mean.item())
-            if kl_penalty_term is not None:
-                mean_kl_penalty += float(kl_penalty_term.item())
             num_updates += 1
 
         if num_updates > 0:
@@ -292,8 +270,6 @@ class Reinforce:
             mean_entropy /= num_updates
             if self.desired_kl is not None:
                 mean_kl /= num_updates
-            if self.kl_penalty_coef > 0.0:
-                mean_kl_penalty /= num_updates
 
         self.storage.clear()
         loss_dict = {
@@ -303,12 +279,9 @@ class Reinforce:
         }
         if self.desired_kl is not None:
             loss_dict["kl"] = mean_kl
-        if self.kl_penalty_coef > 0.0:
-            loss_dict["kl_penalty"] = mean_kl_penalty
         return loss_dict
 
     def broadcast_parameters(self) -> None:
         """Broadcast model parameters to all GPUs (for distributed training)."""
         for param in self.policy.parameters():
             torch.distributed.broadcast(param.data, src=0)
-
