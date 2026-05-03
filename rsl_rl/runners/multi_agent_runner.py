@@ -29,8 +29,11 @@ MODE_SETTLING = 1
 @dataclass
 class InlineSettlingConfig:
     settle_max_steps: int = 20               # 2.0s window at 0.1s control step
-    invalid_settle_penalty: float = -1.0     # reward for a forced-LIVE teacher tuple
+    invalid_settle_penalty: float = -1.0     # teacher reward for exhausted settle proposals
     max_resample_retries: int = 5            # per-env settle attempts before giving up
+    force_live_after_max_retries: bool = True
+    # Legacy path: failed settle becomes LIVE after retries.
+    live_handoff_hold_steps: int = 0         # mask PPO while holding the reset pose after SETTLING
     adversary_update_batch_size: int | None = None  # None ⇒ num_envs (per-rank)
     settling_gripper_default_action: float = -1.0
     # Parameter-only adversary: no SETTLING/LIVE gate or K-pin.
@@ -99,11 +102,7 @@ class MultiAgentRunner:
         self.tot_time = 0
         self.current_learning_iteration = 0
         self.git_status_repos: list[str] = [str(rsl_rl.__file__)]
-        self.adversary_parameter_names = self.cfg.get("adversary_parameter_names", [])
-
         self.beta_gen_reward = float(self.cfg.get("beta_gen_reward", 1.0))
-        self.adversary_kl_penalty_coef = float(self.cfg.get("adversary_kl_penalty_coef", 0.0))
-        self.alg_adversary.kl_penalty_coef = self.adversary_kl_penalty_coef
         self.regret_k = int(self.cfg.get("regret_k", 6))
 
         self.inline = InlineSettlingConfig.from_cfg(self.cfg)
@@ -112,6 +111,7 @@ class MultiAgentRunner:
         self.env_mode = torch.full((n,), MODE_LIVE, dtype=torch.uint8, device=self.device)
         self.settle_remaining = torch.zeros(n, dtype=torch.int32, device=self.device)
         self.settle_retries = torch.zeros(n, dtype=torch.int32, device=self.device)
+        self.live_handoff_remaining = torch.zeros(n, dtype=torch.int32, device=self.device)
         self._pending_adversary_context_ids = torch.empty(0, dtype=torch.long, device=self.device)
         self._pre_success_state: dict | None = None
         self._pending_teacher = torch.zeros(n, dtype=torch.bool, device=self.device)
@@ -122,8 +122,6 @@ class MultiAgentRunner:
             "obs": [], "action": [], "log_prob": [], "mu": [], "sigma": [],
             "gen_reward": [], "reward": [], "regret": [],
         }
-        self._recorded_adversary_params: list[torch.Tensor] = []
-        self._recorded_adversary_param_dim: int | None = None
         self._inline_last_adv_loss: dict[str, float] = {}
         self._inline_last_adv_rewards: dict[str, float] = {}
 
@@ -133,51 +131,109 @@ class MultiAgentRunner:
 
     # Logging
 
-    def _prepare_adversary_param_h5(self) -> str | None:
-        if self.log_dir is None or not self.record_parameters:
-            return None
-        path = os.path.join(self.log_dir, "raw_params.h5")
-        if not self.disable_logs and not os.path.exists(path):
-            with h5py.File(path, "w") as f:
-                f.attrs["param_names"] = [n.encode("utf-8") for n in self.adversary_parameter_names]
-        return path
-
-    def _record_adversary_params(self, action: torch.Tensor, env_indices: torch.Tensor | None) -> None:
-        if not self.record_parameters:
-            return
-        rows = action if env_indices is None else action[env_indices]
-        rows = rows.detach().clone()
-        self._recorded_adversary_param_dim = int(rows.shape[-1])
-        self._recorded_adversary_params.append(rows)
-
-    def _collect_adversary_params(self) -> torch.Tensor | None:
+    def _record_packet_to_cpu(self, packet) -> dict | None:
         if not self.record_parameters:
             return None
-        if self._recorded_adversary_params:
-            local = torch.cat(self._recorded_adversary_params, dim=0).cpu()
-            self._recorded_adversary_params.clear()
-        elif self._recorded_adversary_param_dim is not None:
-            local = torch.empty((0, self._recorded_adversary_param_dim), dtype=torch.float32)
-        else:
+        if not isinstance(packet, dict):
             return None
+
+        raw_datasets = packet.get("datasets")
+        if not isinstance(raw_datasets, dict):
+            return None
+        datasets = {
+            key: value.detach().cpu()
+            for key, value in raw_datasets.items()
+            if isinstance(key, str) and isinstance(value, torch.Tensor) and value.numel() > 0
+        }
+        if not datasets:
+            return None
+        attrs = packet.get("attrs", {})
+        file_name = packet.get("file_name", "adversary_records.h5")
+        return {
+            "datasets": datasets,
+            "attrs": attrs if isinstance(attrs, dict) else {},
+            "file_name": str(file_name),
+        }
+
+    def _merge_record_packets(self, packets: list[dict | None]) -> dict | None:
+        non_empty = [packet for packet in packets if isinstance(packet, dict) and packet.get("datasets")]
+        if not non_empty:
+            return None
+
+        keys = sorted({key for packet in non_empty for key in packet["datasets"]})
+        datasets: dict[str, torch.Tensor] = {}
+        for key in keys:
+            values = [
+                packet["datasets"][key]
+                for packet in non_empty
+                if key in packet["datasets"] and packet["datasets"][key].numel() > 0
+            ]
+            if values:
+                datasets[key] = torch.cat(values, dim=0)
+        if not datasets:
+            return None
+
+        attrs: dict = {}
+        for packet in non_empty:
+            attrs.update(packet.get("attrs", {}))
+        file_name = str(non_empty[0].get("file_name", "adversary_records.h5"))
+        return {"datasets": datasets, "attrs": attrs, "file_name": file_name}
+
+    def _collect_adversary_records(self) -> dict | None:
+        if not self.record_parameters:
+            return None
+        local = self._record_packet_to_cpu(
+            self._call_multi_agent_env_hook("consume_adversary_hdf5_records", default=None)
+        )
 
         if not self.is_distributed:
-            return local if local.numel() > 0 else None
+            return local
 
-        gathered: list[torch.Tensor | None] = [None for _ in range(self.gpu_world_size)]
+        gathered: list[dict | None] = [None for _ in range(self.gpu_world_size)]
         torch.distributed.all_gather_object(gathered, local)
         if self.gpu_global_rank != 0:
             return None
-        non_empty = [t for t in gathered if isinstance(t, torch.Tensor) and t.numel() > 0]
-        return torch.cat(non_empty, dim=0) if non_empty else None
+        return self._merge_record_packets(gathered)
 
-    def _write_adversary_params(self, path: str | None, it: int, params: torch.Tensor | None) -> None:
-        if path is None or params is None or self.disable_logs:
+    def _adversary_record_path(self, records: dict) -> str | None:
+        if self.log_dir is None or self.disable_logs:
+            return None
+        file_name = os.path.basename(str(records.get("file_name", "adversary_records.h5")))
+        if not file_name:
+            file_name = "adversary_records.h5"
+        return os.path.join(self.log_dir, file_name)
+
+    @staticmethod
+    def _write_h5_attr(h5_file, key: str, value) -> None:
+        if isinstance(value, (list, tuple)):
+            h5_file.attrs[key] = [str(v).encode("utf-8") for v in value]
+        elif isinstance(value, str):
+            h5_file.attrs[key] = value
+        elif isinstance(value, (int, float, bool)):
+            h5_file.attrs[key] = value
+
+    def _write_adversary_records(self, it: int, records: dict | None) -> None:
+        if records is None or self.disable_logs:
+            return
+        datasets = records.get("datasets", {})
+        if not isinstance(datasets, dict) or not datasets:
+            return
+        path = self._adversary_record_path(records)
+        if path is None:
             return
         with h5py.File(path, "a") as f:
+            for key, value in records.get("attrs", {}).items():
+                if isinstance(key, str):
+                    self._write_h5_attr(f, key, value)
             group = f.create_group(f"iteration_{it}")
-            group.create_dataset("raw_params", data=params.numpy())
-            group.attrs["num_samples"] = params.shape[0]
+            num_samples = 0
+            for key, value in datasets.items():
+                if not isinstance(key, str) or not isinstance(value, torch.Tensor) or value.numel() == 0:
+                    continue
+                group.create_dataset(key, data=value.numpy())
+                if value.ndim > 0:
+                    num_samples = max(num_samples, int(value.shape[0]))
+            group.attrs["num_samples"] = num_samples
 
     def _install_live_filtered_reward_logging(self) -> None:
         """Filter reward logs to LIVE episodes."""
@@ -244,7 +300,6 @@ class MultiAgentRunner:
             self._scratch_adv_sigma[env_indices] = sigma[env_indices]
 
         self._update_adversary_previous_action_obs(action, env_indices)
-        self._record_adversary_params(action, env_indices)
         return action
 
     def _adversary_update_from_tuples(
@@ -436,11 +491,7 @@ class MultiAgentRunner:
                             fields["root_velocity"][env_ids].clone(), env_ids=env_ids
                         )
             scene.write_data_to_sim()
-            env_unwrapped = self.env.unwrapped
-            for group_buffers in env_unwrapped.observation_manager._group_obs_term_history_buffer.values():
-                for circular_buffer in group_buffers.values():
-                    circular_buffer.reset(batch_ids=env_ids)
-            env_unwrapped.action_manager._prev_action[env_ids] = 0.0
+            self._call_multi_agent_env_hook("on_runner_state_written", env_ids.to(self.env.device))
 
     def _stash_pre_success_for(self, state: dict, env_ids: torch.Tensor) -> None:
         if env_ids.numel() == 0:
@@ -457,6 +508,57 @@ class MultiAgentRunner:
             for asset_name, fields in assets.items():
                 for k, v in fields.items():
                     self._pre_success_state[category][asset_name][k][env_ids] = v[env_ids].clone()
+
+    def _consume_reset_success_state(self, env_ids: torch.Tensor, fallback_state: dict) -> dict:
+        """Allow task hooks to replace the fallback state with a cached success state."""
+        success_state = self._call_multi_agent_env_hook(
+            "consume_reset_success_state",
+            env_ids.to(self.env.device),
+            fallback_state,
+            default=fallback_state,
+        )
+        return success_state if isinstance(success_state, dict) else fallback_state
+
+    def _clear_live_episode_state(self, env_ids: torch.Tensor) -> None:
+        if env_ids.numel() == 0:
+            return
+        self._live_episodes_since_settle[env_ids] = 0
+        for eid in env_ids.tolist():
+            self._per_env_live_returns[eid] = []
+
+    def _activate_live_envs(self, env_ids: torch.Tensor, handoff_steps: int = 0) -> None:
+        if env_ids.numel() == 0:
+            return
+        self.env_mode[env_ids] = MODE_LIVE
+        self.settle_remaining[env_ids] = 0
+        self.settle_retries[env_ids] = 0
+        self.live_handoff_remaining[env_ids] = max(0, int(handoff_steps))
+        self._clear_live_episode_state(env_ids)
+        self._call_multi_agent_env_hook("on_live_anchor_start", env_ids.to(self.env.device))
+
+    def _restart_settling_envs(
+        self,
+        env_ids: torch.Tensor,
+        settle_start: int,
+        obs: TensorDict | None,
+        *,
+        pending_teacher: bool = True,
+    ) -> None:
+        if env_ids.numel() == 0:
+            return
+        self.env_mode[env_ids] = MODE_SETTLING
+        self.settle_remaining[env_ids] = self.inline.settle_max_steps
+        self.settle_retries[env_ids] = 0
+        self.live_handoff_remaining[env_ids] = 0
+        self._clear_live_episode_state(env_ids)
+        self._call_multi_agent_env_hook("on_live_anchor_clear", env_ids.to(self.env.device))
+        with torch.inference_mode():
+            self.env.episode_length_buf[env_ids] = settle_start
+        if obs is None:
+            obs = self.env.get_observations().to(self.device)
+        self._sample_adversary_capture(obs, env_indices=env_ids)
+        if pending_teacher:
+            self._pending_teacher[env_ids] = True
 
     # Mode transitions
 
@@ -479,8 +581,7 @@ class MultiAgentRunner:
             if not bool(self._pending_teacher[eid].item()):
                 self._stash_pre_success_for(post_reset_state, single_id)
                 self._pending_teacher[eid] = True
-                self._live_episodes_since_settle[eid] = 0
-                self._per_env_live_returns[eid] = []
+                self._clear_live_episode_state(single_id)
                 continue
 
             self._live_episodes_since_settle[eid] += 1
@@ -496,8 +597,7 @@ class MultiAgentRunner:
                 self._commit_teacher(
                     env_id=eid, gen_reward=0.0, combined_reward=combined, regret=regret,
                 )
-                self._live_episodes_since_settle[eid] = 0
-                self._per_env_live_returns[eid] = []
+                self._clear_live_episode_state(single_id)
                 self._sample_adversary_capture(obs, env_indices=single_id)
 
         return state_was_written
@@ -519,14 +619,16 @@ class MultiAgentRunner:
         settle_start = max(0, max_ep_len - self.inline.settle_max_steps)
 
         settling_mask = (self.env_mode == MODE_SETTLING)
-        live_mask = ~settling_mask
+        handoff_mask = (~settling_mask) & (self.live_handoff_remaining > 0)
+        active_live_mask = (~settling_mask) & ~handoff_mask
         dones_bool = dones.to(torch.bool).view(-1)
 
         success_this_step = term_mgr._last_episode_dones[:, success_idx].to(torch.bool) & dones_bool
         success_in_settle = success_this_step & settling_mask
         if success_in_settle.any():
             success_ids = success_in_settle.nonzero(as_tuple=False).squeeze(-1)
-            self._stash_pre_success_for(scene_state_pre, success_ids)
+            success_state = self._consume_reset_success_state(success_ids, scene_state_pre)
+            self._stash_pre_success_for(success_state, success_ids)
             self._pending_gen_reward[success_ids] = rewards[success_ids].view(-1).float()
 
         done_settling = settling_mask & dones_bool
@@ -543,13 +645,7 @@ class MultiAgentRunner:
                     self._write_state_to_sim(self._pre_success_state, valid_ids)
                     state_was_written = True
                 self._pending_adversary_context_ids = valid_ids.detach().clone()
-                self.env_mode[valid_ids] = MODE_LIVE
-                self.settle_remaining[valid_ids] = 0
-                self.settle_retries[valid_ids] = 0
-                self._live_episodes_since_settle[valid_ids] = 0
-                self._call_multi_agent_env_hook("on_live_anchor_start", valid_ids.to(self.env.device))
-                for eid in valid_ids.tolist():
-                    self._per_env_live_returns[eid] = []
+                self._activate_live_envs(valid_ids, handoff_steps=self.inline.live_handoff_hold_steps)
                 self._reset_student_rnn(valid_ids)
                 cur_reward_sum[valid_ids] = 0.0
                 cur_episode_length[valid_ids] = 0.0
@@ -579,16 +675,23 @@ class MultiAgentRunner:
                     with torch.inference_mode():
                         self.env.unwrapped._reset_idx(giveup_ids)
                     state_was_written = True
-                    self.env_mode[giveup_ids] = MODE_LIVE
-                    self.settle_remaining[giveup_ids] = 0
-                    self.settle_retries[giveup_ids] = 0
-                    self._live_episodes_since_settle[giveup_ids] = 0
-                    self._call_multi_agent_env_hook("on_live_anchor_start", giveup_ids.to(self.env.device))
+
+                    if self.inline.force_live_after_max_retries:
+                        self._activate_live_envs(giveup_ids)
+                    else:
+                        self._restart_settling_envs(giveup_ids, settle_start, obs=None)
+                        self._pending_gen_reward[giveup_ids] = 0.0
+
                     self._reset_student_rnn(giveup_ids)
                     cur_reward_sum[giveup_ids] = 0.0
                     cur_episode_length[giveup_ids] = 0.0
 
-        live_done = live_mask & dones_bool
+        handoff_done = handoff_mask & dones_bool
+        if handoff_done.any():
+            handoff_done_ids = handoff_done.nonzero(as_tuple=False).squeeze(-1)
+            self._restart_settling_envs(handoff_done_ids, settle_start, obs)
+
+        live_done = active_live_mask & dones_bool
         if live_done.any():
             ids = live_done.nonzero(as_tuple=False).squeeze(-1)
             for eid in ids.tolist():
@@ -610,27 +713,10 @@ class MultiAgentRunner:
                             env_id=eid, gen_reward=gen_r, combined_reward=combined, regret=regret,
                         )
                         single_id = torch.tensor([eid], device=self.device, dtype=torch.long)
-                        self.env_mode[eid] = MODE_SETTLING
-                        self._call_multi_agent_env_hook("on_live_anchor_clear", single_id.to(self.env.device))
-                        self.settle_remaining[eid] = self.inline.settle_max_steps
-                        self.settle_retries[eid] = 0
-                        self._live_episodes_since_settle[eid] = 0
-                        self._per_env_live_returns[eid] = []
-                        with torch.inference_mode():
-                            self.env.episode_length_buf[eid] = settle_start
-                        self._sample_adversary_capture(obs, env_indices=single_id)
-                        self._pending_teacher[eid] = True
+                        self._restart_settling_envs(single_id, settle_start, obs)
                 else:
                     single_id = torch.tensor([eid], device=self.device, dtype=torch.long)
-                    self.env_mode[eid] = MODE_SETTLING
-                    self._call_multi_agent_env_hook("on_live_anchor_clear", single_id.to(self.env.device))
-                    self.settle_remaining[eid] = self.inline.settle_max_steps
-                    self.settle_retries[eid] = 0
-                    self._live_episodes_since_settle[eid] = 0
-                    with torch.inference_mode():
-                        self.env.episode_length_buf[eid] = settle_start
-                    self._sample_adversary_capture(obs, env_indices=single_id)
-                    self._pending_teacher[eid] = True
+                    self._restart_settling_envs(single_id, settle_start, obs)
 
         return state_was_written
 
@@ -701,6 +787,7 @@ class MultiAgentRunner:
             self.env_mode.fill_(MODE_SETTLING)
             self.settle_remaining.fill_(self.inline.settle_max_steps)
             self.settle_retries.zero_()
+            self.live_handoff_remaining.zero_()
             self._pending_teacher.fill_(True)
             with torch.inference_mode():
                 self.env.episode_length_buf.fill_(settle_start_len)
@@ -709,7 +796,6 @@ class MultiAgentRunner:
 
         start_iter = self.current_learning_iteration
         tot_iter = start_iter + num_learning_iterations
-        param_h5_path = self._prepare_adversary_param_h5()
 
         adv_action_zero_template = torch.zeros(
             (self.env.num_envs, self.adversary_action_dim), device=self.device
@@ -723,18 +809,21 @@ class MultiAgentRunner:
                     policy_actions = self.alg.act(obs)
 
                     settling_mask = (self.env_mode == MODE_SETTLING)
+                    handoff_mask = (~settling_mask) & (self.live_handoff_remaining > 0)
                     live_mask = ~settling_mask
+                    train_live_mask = live_mask & ~handoff_mask
 
                     if self.inline.skip_settling:
                         student_actions = policy_actions
                         adv_slice = self._scratch_adv_action
                     else:
                         student_actions = policy_actions.clone()
-                        if settling_mask.any():
-                            student_actions[settling_mask] = 0.0
+                        controlled_mask = settling_mask | handoff_mask
+                        if controlled_mask.any():
+                            student_actions[controlled_mask] = 0.0
                             if self.policy_action_dim > 0:
                                 gripper_targets = self._settling_gripper_targets()
-                                student_actions[settling_mask, -1] = gripper_targets[settling_mask]
+                                student_actions[controlled_mask, -1] = gripper_targets[controlled_mask]
 
                         adv_slice = adv_action_zero_template
                         if settling_mask.any():
@@ -751,12 +840,12 @@ class MultiAgentRunner:
                             write_state=True,
                         )
 
-                    valid_mask = live_mask.float().unsqueeze(-1)
+                    valid_mask = train_live_mask.float().unsqueeze(-1)
                     scene_state_pre = unwrapped_env.scene.get_state(is_relative=True)
 
                     if command_term_handle is not None:
                         command_term_handle._live_mask.copy_(
-                            live_mask.to(command_term_handle._live_mask.device)
+                            train_live_mask.to(command_term_handle._live_mask.device)
                         )
 
                     obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
@@ -771,9 +860,8 @@ class MultiAgentRunner:
                         self.settle_remaining[settling_mask_now] = torch.clamp(
                             self.settle_remaining[settling_mask_now] - 1, min=0
                         )
-
                     dones_bool = dones.to(torch.bool).view(-1)
-                    live_dones = dones_bool & live_mask
+                    live_dones = dones_bool & train_live_mask
                     if self.log_dir is not None and live_dones.any():
                         if "episode" in extras:
                             ep_infos.append(extras["episode"])
@@ -781,7 +869,7 @@ class MultiAgentRunner:
                             ep_infos.append(extras["log"])
 
                     done_ids = (dones > 0).nonzero(as_tuple=False)
-                    live_mask_float = live_mask.to(cur_reward_sum.dtype)
+                    live_mask_float = train_live_mask.to(cur_reward_sum.dtype)
                     cur_reward_sum += rewards * live_mask_float
                     cur_episode_length += live_mask_float
 
@@ -797,7 +885,7 @@ class MultiAgentRunner:
                     counted_rets: list[float] = []
                     counted_lens: list[float] = []
                     for env_idx, ret, ep_len in zip(done_env_list, ep_returns_list, cur_lens_list):
-                        if int(self.env_mode[env_idx].item()) != MODE_LIVE:
+                        if not bool(train_live_mask[env_idx].item()):
                             continue
                         self._per_env_live_returns[env_idx].append(float(ret))
                         counted_rets.append(float(ret))
@@ -807,7 +895,7 @@ class MultiAgentRunner:
                         rewbuffer.extend(counted_rets)
                         lenbuffer.extend(counted_lens)
 
-                    live_done_env_indices = done_env_indices[self.env_mode[done_env_indices] == MODE_LIVE]
+                    live_done_env_indices = done_env_indices[train_live_mask[done_env_indices]]
                     self._call_multi_agent_env_hook(
                         "on_live_episode_done",
                         live_done_env_indices.to(self.env.device),
@@ -829,6 +917,13 @@ class MultiAgentRunner:
                         cur_reward_sum=cur_reward_sum,
                         cur_episode_length=cur_episode_length,
                     )
+                if not self.inline.skip_settling:
+                    handoff_mask_now = (self.env_mode == MODE_LIVE) & (self.live_handoff_remaining > 0)
+                    if handoff_mask_now.any():
+                        handoff_ids_before = handoff_mask_now.nonzero(as_tuple=False).squeeze(-1)
+                        self.live_handoff_remaining[handoff_ids_before] = torch.clamp(
+                            self.live_handoff_remaining[handoff_ids_before] - 1, min=0
+                        )
                 if state_was_written:
                     obs = self.env.get_observations().to(self.device)
                     self._call_multi_agent_env_hook(
@@ -839,7 +934,7 @@ class MultiAgentRunner:
                     self._pending_adversary_context_ids = torch.empty(0, dtype=torch.long, device=self.device)
 
             collection_time = time.time() - collection_start
-            raw_params_cpu = self._collect_adversary_params()
+            adversary_records = self._collect_adversary_records()
 
             learn_start = time.time()
             with torch.inference_mode():
@@ -876,15 +971,8 @@ class MultiAgentRunner:
                 self._emit_inline_iter_metrics(self.writer, it)
                 for key, value in env_iter_metrics.items():
                     self.writer.add_scalar(key, value, it)
-                env_metrics_message = self._call_multi_agent_env_hook(
-                    "format_iter_metrics",
-                    env_iter_metrics,
-                    default=None,
-                )
-                if env_metrics_message:
-                    print(env_metrics_message)
 
-                self._write_adversary_params(param_h5_path, it, raw_params_cpu)
+                self._write_adversary_records(it, adversary_records)
 
                 if it % self.save_interval == 0:
                     self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
