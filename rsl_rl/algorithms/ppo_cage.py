@@ -238,6 +238,7 @@ class PPO:
         mean_rnd_loss = 0 if self.rnd else None
         # Symmetry loss
         mean_symmetry_loss = 0 if self.symmetry else None
+        num_updates = 0
 
         # Get mini batch generator
         if self.policy.is_recurrent:
@@ -270,10 +271,12 @@ class PPO:
             if valid_mask_batch is not None and valid_mask_batch.dim() > 2:
                 valid_mask_batch = None
 
-            # Safety: PPO update with zero valid transitions is undefined. Fail
-            # loudly so the caller can diagnose (e.g. all envs stuck SETTLING).
-            if valid_mask_batch is not None and bool((valid_mask_batch == 0.0).all().item()):
-                raise RuntimeError("PPO update received a minibatch with zero valid transitions.")
+            if valid_mask_batch is not None:
+                valid_count = valid_mask_batch.sum().detach()
+                if self.is_multi_gpu:
+                    torch.distributed.all_reduce(valid_count, op=torch.distributed.ReduceOp.SUM)
+                if float(valid_count.item()) <= 0.0:
+                    continue
 
             # Check if we should normalize advantages per mini batch
             if self.normalize_advantage_per_mini_batch:
@@ -455,16 +458,19 @@ class PPO:
             # Symmetry loss
             if mean_symmetry_loss is not None:
                 mean_symmetry_loss += symmetry_loss.item()
+            num_updates += 1
 
-        # Divide the losses by the number of updates
-        num_updates = self.num_learning_epochs * self.num_mini_batches
-        mean_value_loss /= num_updates
-        mean_surrogate_loss /= num_updates
-        mean_entropy /= num_updates
-        if mean_rnd_loss is not None:
-            mean_rnd_loss /= num_updates
-        if mean_symmetry_loss is not None:
-            mean_symmetry_loss /= num_updates
+        # Divide by the number of minibatches that had at least one valid LIVE
+        # transition globally. Early CAGE rollouts may be all SETTLING, which
+        # should produce no robot PPO update rather than a fatal error.
+        if num_updates > 0:
+            mean_value_loss /= num_updates
+            mean_surrogate_loss /= num_updates
+            mean_entropy /= num_updates
+            if mean_rnd_loss is not None:
+                mean_rnd_loss /= num_updates
+            if mean_symmetry_loss is not None:
+                mean_symmetry_loss /= num_updates
 
         # Clear the storage
         self.storage.clear()

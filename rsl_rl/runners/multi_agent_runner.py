@@ -269,26 +269,35 @@ class MultiAgentRunner:
             return
         action_term.set_previous_actions(action.detach(), env_indices)
 
-    def _prepare_adversary_proposal_context(self, env_indices: torch.Tensor | None, obs):
-        hooks = self._multi_agent_env_hooks()
-        prepare = getattr(hooks, "prepare_adversary_proposal_context", None)
-        if not callable(prepare):
-            return obs
-        if env_indices is None:
-            env_ids = torch.arange(self.env.num_envs, device=self.env.device, dtype=torch.long)
-        else:
-            env_ids = env_indices.to(self.env.device, dtype=torch.long)
-        if env_ids.numel() == 0:
-            return obs
-        with torch.inference_mode():
-            prepare(env_ids)
-        return self.env.get_observations().to(self.device)
+    def _set_adversary_raw_actions_for_reset(self, env_indices: torch.Tensor) -> None:
+        action_term = getattr(getattr(self.env, "unwrapped", self.env).action_manager, "_terms", {}).get("adversaryaction")
+        raw_actions = getattr(action_term, "raw_actions", None)
+        if not isinstance(raw_actions, torch.Tensor):
+            return
+        source_ids = env_indices.to(self._scratch_adv_action.device)
+        target_ids = env_indices.to(raw_actions.device)
+        raw_actions[target_ids] = self._scratch_adv_action[source_ids].to(raw_actions.device)
 
     def _sample_adversary_capture(
         self, obs, env_indices: torch.Tensor | None = None
-    ):
+    ) -> torch.Tensor:
         """Sample adversary actions into per-env scratch."""
-        obs = self._prepare_adversary_proposal_context(env_indices, obs)
+        hook_env_ids = None if env_indices is None else env_indices.to(self.env.device)
+        hooks = self._multi_agent_env_hooks()
+        prepare_context = getattr(hooks, "prepare_adversary_proposal_context", None)
+        if callable(prepare_context):
+            restore_env_ids = (
+                torch.arange(self.env.num_envs, device=self.device, dtype=torch.long)
+                if env_indices is None
+                else env_indices
+            )
+            restore_state = self.env.unwrapped.scene.get_state(is_relative=True)
+            with torch.inference_mode():
+                context_changed = bool(prepare_context(hook_env_ids))
+            if context_changed:
+                obs = self.env.get_observations().to(self.device)
+                self._write_state_to_sim(restore_state, restore_env_ids, notify_hooks=False)
+
         with torch.inference_mode():
             action = self.alg_adversary.policy.act(obs).detach()
             log_prob = self.alg_adversary.policy.get_actions_log_prob(action).detach()
@@ -300,6 +309,7 @@ class MultiAgentRunner:
                 sigma = sigma_raw.clone()
 
         log_prob_2d = log_prob.view(-1, 1)
+
         if env_indices is None:
             self._scratch_adv_obs = obs.clone()
             self._scratch_adv_action = action.clone()
@@ -307,15 +317,14 @@ class MultiAgentRunner:
             self._scratch_adv_mu = mu.clone()
             self._scratch_adv_sigma = sigma.clone()
         else:
-            target_ids = env_indices.to(self.device, dtype=torch.long)
-            self._scratch_adv_obs[target_ids] = obs[target_ids]
-            self._scratch_adv_action[target_ids] = action[target_ids]
-            self._scratch_adv_log_prob[target_ids] = log_prob_2d[target_ids]
-            self._scratch_adv_mu[target_ids] = mu[target_ids]
-            self._scratch_adv_sigma[target_ids] = sigma[target_ids]
+            self._scratch_adv_obs[env_indices] = obs[env_indices]
+            self._scratch_adv_action[env_indices] = action[env_indices]
+            self._scratch_adv_log_prob[env_indices] = log_prob_2d[env_indices]
+            self._scratch_adv_mu[env_indices] = mu[env_indices]
+            self._scratch_adv_sigma[env_indices] = sigma[env_indices]
 
         self._update_adversary_previous_action_obs(action, env_indices)
-        return obs
+        return action
 
     def _adversary_update_from_tuples(
         self, tuples: dict, rewards: torch.Tensor, last_obs
@@ -470,7 +479,7 @@ class MultiAgentRunner:
 
     # State restore
 
-    def _write_state_to_sim(self, state: dict, env_ids: torch.Tensor) -> None:
+    def _write_state_to_sim(self, state: dict, env_ids: torch.Tensor, notify_hooks: bool = True) -> None:
         """Restore saved scene state."""
         if env_ids.numel() == 0:
             return
@@ -506,7 +515,8 @@ class MultiAgentRunner:
                             fields["root_velocity"][env_ids].clone(), env_ids=env_ids
                         )
             scene.write_data_to_sim()
-            self._call_multi_agent_env_hook("on_runner_state_written", env_ids.to(self.env.device))
+            if notify_hooks:
+                self._call_multi_agent_env_hook("on_runner_state_written", env_ids.to(self.env.device))
 
     def _stash_pre_success_for(self, state: dict, env_ids: torch.Tensor) -> None:
         if env_ids.numel() == 0:
@@ -558,22 +568,26 @@ class MultiAgentRunner:
         obs: TensorDict | None,
         *,
         pending_teacher: bool = True,
-    ) -> None:
+    ) -> bool:
         if env_ids.numel() == 0:
-            return
+            return False
         self.env_mode[env_ids] = MODE_SETTLING
         self.settle_remaining[env_ids] = self.inline.settle_max_steps
         self.settle_retries[env_ids] = 0
         self.live_handoff_remaining[env_ids] = 0
         self._clear_live_episode_state(env_ids)
         self._call_multi_agent_env_hook("on_live_anchor_clear", env_ids.to(self.env.device))
-        with torch.inference_mode():
-            self.env.episode_length_buf[env_ids] = settle_start
         if obs is None:
             obs = self.env.get_observations().to(self.device)
-        obs = self._sample_adversary_capture(obs, env_indices=env_ids)
+        self._sample_adversary_capture(obs, env_indices=env_ids)
+        self._set_adversary_raw_actions_for_reset(env_ids)
+        reset_ids = env_ids.to(self.env.device)
+        with torch.inference_mode():
+            self.env.unwrapped._reset_idx(reset_ids)
+            self.env.episode_length_buf[env_ids] = settle_start
         if pending_teacher:
             self._pending_teacher[env_ids] = True
+        return True
 
     # Mode transitions
 
@@ -613,7 +627,7 @@ class MultiAgentRunner:
                     env_id=eid, gen_reward=0.0, combined_reward=combined, regret=regret,
                 )
                 self._clear_live_episode_state(single_id)
-                obs = self._sample_adversary_capture(obs, env_indices=single_id)
+                self._sample_adversary_capture(obs, env_indices=single_id)
 
         return state_was_written
 
@@ -671,40 +685,31 @@ class MultiAgentRunner:
                 giveup_ids = invalid_ids[~can_retry]
 
                 if retry_ids.numel() > 0:
-                    for eid in retry_ids.tolist():
-                        if bool(self._pending_teacher[eid].item()):
-                            gen_r = float(self.inline.invalid_settle_penalty)
-                            self._commit_teacher(
-                                env_id=eid,
-                                gen_reward=gen_r,
-                                combined_reward=self.beta_gen_reward * gen_r,
-                            )
-                    with torch.inference_mode():
-                        self.env.episode_length_buf[retry_ids] = settle_start
                     self.settle_remaining[retry_ids] = self.inline.settle_max_steps
                     self.settle_retries[retry_ids] += 1
-                    obs = self._sample_adversary_capture(obs, env_indices=retry_ids)
-                    self._pending_teacher[retry_ids] = True
-                    self._pending_gen_reward[retry_ids] = 0.0
+                    self._sample_adversary_capture(obs, env_indices=retry_ids)
+                    self._set_adversary_raw_actions_for_reset(retry_ids)
+                    with torch.inference_mode():
+                        self.env.unwrapped._reset_idx(retry_ids.to(self.env.device))
+                        self.env.episode_length_buf[retry_ids] = settle_start
+                    state_was_written = True
                     self._reset_student_rnn(retry_ids)
 
                 if giveup_ids.numel() > 0:
                     for eid in giveup_ids.tolist():
                         if bool(self._pending_teacher[eid].item()):
-                            gen_r = float(self.inline.invalid_settle_penalty)
                             self._commit_teacher(
                                 env_id=eid,
-                                gen_reward=gen_r,
-                                combined_reward=self.beta_gen_reward * gen_r,
+                                gen_reward=float(self._pending_gen_reward[eid].item()),
+                                combined_reward=self.inline.invalid_settle_penalty,
                             )
-                    with torch.inference_mode():
-                        self.env.unwrapped._reset_idx(giveup_ids)
-                    state_was_written = True
-
                     if self.inline.force_live_after_max_retries:
+                        with torch.inference_mode():
+                            self.env.unwrapped._reset_idx(giveup_ids.to(self.env.device))
+                        state_was_written = True
                         self._activate_live_envs(giveup_ids)
                     else:
-                        self._restart_settling_envs(giveup_ids, settle_start, obs=None)
+                        state_was_written |= self._restart_settling_envs(giveup_ids, settle_start, obs=None)
                         self._pending_gen_reward[giveup_ids] = 0.0
 
                     self._reset_student_rnn(giveup_ids)
@@ -714,7 +719,7 @@ class MultiAgentRunner:
         handoff_done = handoff_mask & dones_bool
         if handoff_done.any():
             handoff_done_ids = handoff_done.nonzero(as_tuple=False).squeeze(-1)
-            self._restart_settling_envs(handoff_done_ids, settle_start, obs)
+            state_was_written |= self._restart_settling_envs(handoff_done_ids, settle_start, obs)
 
         live_done = active_live_mask & dones_bool
         if live_done.any():
@@ -738,10 +743,10 @@ class MultiAgentRunner:
                             env_id=eid, gen_reward=gen_r, combined_reward=combined, regret=regret,
                         )
                         single_id = torch.tensor([eid], device=self.device, dtype=torch.long)
-                        self._restart_settling_envs(single_id, settle_start, obs)
+                        state_was_written |= self._restart_settling_envs(single_id, settle_start, obs)
                 else:
                     single_id = torch.tensor([eid], device=self.device, dtype=torch.long)
-                    self._restart_settling_envs(single_id, settle_start, obs)
+                    state_was_written |= self._restart_settling_envs(single_id, settle_start, obs)
 
         return state_was_written
 
@@ -793,13 +798,20 @@ class MultiAgentRunner:
         except (AttributeError, KeyError):
             command_term_handle = None
 
-        obs = self._sample_adversary_capture(obs, env_indices=None)
+        self._sample_adversary_capture(obs, env_indices=None)
 
         max_ep_len = int(self.env.max_episode_length)
         settle_start_len = max(0, max_ep_len - self.inline.settle_max_steps)
         student_zero = torch.zeros(
             self.env.num_envs, self.policy_action_dim, device=self.env.device
         )
+        if not self.inline.skip_settling and self.policy_action_dim > 0:
+            gripper_targets = self._settling_gripper_targets()
+            student_zero[:, -1] = gripper_targets.to(self.env.device)
+            self._call_multi_agent_env_hook(
+                "set_settling_control_mask",
+                torch.ones(self.env.num_envs, dtype=torch.bool, device=self.env.device),
+            )
         prime_actions = torch.cat(
             [student_zero, self._scratch_adv_action.to(self.env.device)], dim=-1
         )
@@ -816,8 +828,6 @@ class MultiAgentRunner:
             self._pending_teacher.fill_(True)
             with torch.inference_mode():
                 self.env.episode_length_buf.fill_(settle_start_len)
-
-            obs = self._sample_adversary_capture(obs, env_indices=None)
 
         start_iter = self.current_learning_iteration
         tot_iter = start_iter + num_learning_iterations
@@ -849,6 +859,10 @@ class MultiAgentRunner:
                             if self.policy_action_dim > 0:
                                 gripper_targets = self._settling_gripper_targets()
                                 student_actions[controlled_mask, -1] = gripper_targets[controlled_mask]
+                        self._call_multi_agent_env_hook(
+                            "set_settling_control_mask",
+                            controlled_mask.to(self.env.device),
+                        )
 
                         adv_slice = adv_action_zero_template
                         if settling_mask.any():
