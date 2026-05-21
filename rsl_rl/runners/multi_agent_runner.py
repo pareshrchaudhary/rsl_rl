@@ -179,7 +179,7 @@ class MultiAgentRunner:
         return {"datasets": datasets, "attrs": attrs, "file_name": file_name}
 
     def _collect_adversary_records(self) -> dict | None:
-        if not self.record_parameters:
+        if not self.record_parameters or not self.cfg.get("save_accepted_omnireset_datasets", True):
             return None
         local = self._record_packet_to_cpu(
             self._call_multi_agent_env_hook("consume_adversary_hdf5_records", default=None)
@@ -359,6 +359,11 @@ class MultiAgentRunner:
             )
         self._success_term_idx = idx
         return idx
+
+    def _settling_episode_start_len(self) -> int:
+        """Episode counter offset so ``check_reset_state_success`` times out with settle_max_steps."""
+        max_ep_len = int(self.env.max_episode_length)
+        return max(0, max_ep_len - self.inline.settle_max_steps)
 
     # Adversary updates
 
@@ -558,13 +563,14 @@ class MultiAgentRunner:
         self.settle_remaining[env_ids] = 0
         self.settle_retries[env_ids] = 0
         self.live_handoff_remaining[env_ids] = max(0, int(handoff_steps))
+        # Full OmniReset-length LIVE segment: settling must not consume the 16s budget.
+        self.env.episode_length_buf[env_ids] = 0
         self._clear_live_episode_state(env_ids)
         self._call_multi_agent_env_hook("on_live_anchor_start", env_ids.to(self.env.device))
 
     def _restart_settling_envs(
         self,
         env_ids: torch.Tensor,
-        settle_start: int,
         obs: TensorDict | None,
         *,
         pending_teacher: bool = True,
@@ -584,7 +590,7 @@ class MultiAgentRunner:
         reset_ids = env_ids.to(self.env.device)
         with torch.inference_mode():
             self.env.unwrapped._reset_idx(reset_ids)
-            self.env.episode_length_buf[env_ids] = settle_start
+            self.env.episode_length_buf[env_ids] = self._settling_episode_start_len()
         if pending_teacher:
             self._pending_teacher[env_ids] = True
         return True
@@ -644,9 +650,6 @@ class MultiAgentRunner:
     ) -> bool:
         """Resolve LIVE/SETTLING transitions."""
         state_was_written = False
-        max_ep_len = int(self.env.max_episode_length)
-        settle_start = max(0, max_ep_len - self.inline.settle_max_steps)
-
         settling_mask = (self.env_mode == MODE_SETTLING)
         handoff_mask = (~settling_mask) & (self.live_handoff_remaining > 0)
         active_live_mask = (~settling_mask) & ~handoff_mask
@@ -691,7 +694,7 @@ class MultiAgentRunner:
                     self._set_adversary_raw_actions_for_reset(retry_ids)
                     with torch.inference_mode():
                         self.env.unwrapped._reset_idx(retry_ids.to(self.env.device))
-                        self.env.episode_length_buf[retry_ids] = settle_start
+                        self.env.episode_length_buf[retry_ids] = self._settling_episode_start_len()
                     state_was_written = True
                     self._reset_student_rnn(retry_ids)
 
@@ -709,7 +712,7 @@ class MultiAgentRunner:
                         state_was_written = True
                         self._activate_live_envs(giveup_ids)
                     else:
-                        state_was_written |= self._restart_settling_envs(giveup_ids, settle_start, obs=None)
+                        state_was_written |= self._restart_settling_envs(giveup_ids, obs=None)
                         self._pending_gen_reward[giveup_ids] = 0.0
 
                     self._reset_student_rnn(giveup_ids)
@@ -719,7 +722,7 @@ class MultiAgentRunner:
         handoff_done = handoff_mask & dones_bool
         if handoff_done.any():
             handoff_done_ids = handoff_done.nonzero(as_tuple=False).squeeze(-1)
-            state_was_written |= self._restart_settling_envs(handoff_done_ids, settle_start, obs)
+            state_was_written |= self._restart_settling_envs(handoff_done_ids, obs)
 
         live_done = active_live_mask & dones_bool
         if live_done.any():
@@ -743,10 +746,10 @@ class MultiAgentRunner:
                             env_id=eid, gen_reward=gen_r, combined_reward=combined, regret=regret,
                         )
                         single_id = torch.tensor([eid], device=self.device, dtype=torch.long)
-                        state_was_written |= self._restart_settling_envs(single_id, settle_start, obs)
+                        state_was_written |= self._restart_settling_envs(single_id, obs)
                 else:
                     single_id = torch.tensor([eid], device=self.device, dtype=torch.long)
-                    state_was_written |= self._restart_settling_envs(single_id, settle_start, obs)
+                    state_was_written |= self._restart_settling_envs(single_id, obs)
 
         return state_was_written
 
@@ -801,7 +804,6 @@ class MultiAgentRunner:
         self._sample_adversary_capture(obs, env_indices=None)
 
         max_ep_len = int(self.env.max_episode_length)
-        settle_start_len = max(0, max_ep_len - self.inline.settle_max_steps)
         student_zero = torch.zeros(
             self.env.num_envs, self.policy_action_dim, device=self.env.device
         )
@@ -827,7 +829,7 @@ class MultiAgentRunner:
             self.live_handoff_remaining.zero_()
             self._pending_teacher.fill_(True)
             with torch.inference_mode():
-                self.env.episode_length_buf.fill_(settle_start_len)
+                self.env.episode_length_buf.fill_(self._settling_episode_start_len())
 
         start_iter = self.current_learning_iteration
         tot_iter = start_iter + num_learning_iterations
@@ -871,11 +873,11 @@ class MultiAgentRunner:
 
                     actions = torch.cat([student_actions, adv_slice], dim=-1)
 
-                    if not self.inline.skip_settling and settling_mask.any():
-                        settling_ids = settling_mask.nonzero(as_tuple=False).squeeze(-1)
+                    if not self.inline.skip_settling and (settling_mask | handoff_mask).any():
+                        pin_ids = (settling_mask | handoff_mask).nonzero(as_tuple=False).squeeze(-1)
                         self._call_multi_agent_env_hook(
                             "apply_settling_state_targets",
-                            settling_ids.to(self.env.device),
+                            pin_ids.to(self.env.device),
                             write_state=True,
                         )
 
